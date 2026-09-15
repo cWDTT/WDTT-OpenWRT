@@ -29,6 +29,86 @@ wget -O /tmp/wdtt-install.sh \
 sh /tmp/wdtt-install.sh
 ```
 
+## Установка на роутер — по шагам
+
+Полный путь от чистого роутера до работающего туннеля. Ниже, в «Вариантах A–D», описаны только способы **доставить** установщик, если обычный `wget` не работает.
+
+### Что нужно до начала
+
+От владельца VPS (в Telegram-боте сервера или в ссылке `wdtt://`):
+
+- **peer** — адрес и порт сервера, например `203.0.113.10:56000`
+- **пароль** туннеля
+- **ссылка на звонок VK** вида `https://vk.com/call/join/…` — от 1 до 4 штук
+
+Ссылка должна быть от **живого** звонка (VK → Звонки → Создать звонок → Копировать ссылку). Ссылка на группу или беседу не подходит: клиент получит `Invalid join link (error_code=954)`.
+
+На роутере нужны OpenWrt **24.10+ / 25.x**, не менее **20 МБ** свободного места в `/overlay` (установщик проверяет и отказывается ставиться, если меньше) и рабочий интернет.
+
+### Шаг 1. Запустить установщик
+
+```bash
+wget -O /tmp/wdtt-install.sh \
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@d6e3123/install.sh
+sh /tmp/wdtt-install.sh
+```
+
+Пакеты установщик доставит сам: `wireguard-tools`, `kmod-wireguard`, `nftables`, `kmod-nft-core`, `kmod-nft-nat`, `ca-bundle`, а также `kmod-tun` (нужен только для RAW-режима). Отдельно он заменяет `dnsmasq` на **`dnsmasq-full`** — без него не работает выборочный режим, потому что домены раскладываются через `nftset`. Эти два пакета взаимоисключающие, поэтому замена штатная.
+
+Демон `wdttd` тянется с jsDelivr, так что доступ к GitHub Releases с роутера не обязателен.
+
+В конце должно быть `WDTT installer v3.18.4+` и проверки `[OK] routing (nft+nftset)`, `dnsmasq nftset`, `firewall lan→wdtt`.
+
+Установщик молча стоит 1–3 минуты на `firewall reload` после строки с `device_id` — это нормально, прерывать не нужно.
+
+### Шаг 2. Заполнить настройки в LuCI
+
+LuCI → **Сервисы** → **WDTT VPN**:
+
+1. **peer** и **пароль** — из данных VPS
+2. **VK-хеш 1…4** — вставляйте ссылку целиком, поле само отрежет лишнее
+3. **Потоки** — 9 на каждую ссылку: одна ссылка → 9, четыре → 36
+4. **MTU** — оставьте **1240**
+5. **Режим VK** — `VKCalls`
+6. **Save & Apply**
+
+Число потоков округляется вниз до кратного 9 (минимум 9), потому что группа воркеров всегда состоит из 9 штук: значение `12` из конфига по умолчанию превратится в `9`.
+
+Одной ссылки достаточно и для 36 потоков: группы разберут её по кругу, каждая под своим `device_id`. Подробнее — «Одна ссылка на несколько групп».
+
+### Шаг 3. Выбрать режим
+
+По умолчанию после установки стоит **Podkop (external)**. Если Podkop у вас не используется, выберите **полный** или **выборочный** — см. «Режимы работы».
+
+### Шаг 4. Подключить
+
+Кнопка **Подключить** в LuCI. В блоке «Ход подключения» должна появиться такая цепочка:
+
+```
+[ГРУППА #1] Креды OK, TURN: […]
+[ВОРКЕР #1] [DTLS] Соединение установлено ✓
+[ВОРКЕР #1] [READY] Туннель готов к работе ✓
+[ВОРКЕР #1] Конфиг получен
+[WG] Туннель wg-wdtt поднят (mode=full)
+```
+
+Ошибки в логе красные, предупреждения жёлтые, успешные шаги зелёные.
+
+### Шаг 5. Убедиться, что туннель живой
+
+```bash
+wg show                      # нужен свежий latest handshake и ненулевой transfer
+/usr/libexec/wdtt/doctor     # общая проверка: handshake, masquerade, lan→wdtt
+```
+
+Если `wg show` пуст — интерфейса нет, значит сервер не отдал конфиг. Если handshake есть, а трафика нет — смотрите «Нет трафика в любом режиме».
+
+Строка `Трафик: 0.00 МБ` сама по себе не означает поломку: счётчик округляет до 0.01 МБ, а в выборочном режиме без настроенных доменов в туннель просто нечего пускать.
+
+### Шаг 6. Настроить, что идёт в туннель
+
+Зависит от режима: в **выборочном** — домены в LuCI → «Правила маршрутизации», в **Podkop** — списки в самом Podkop, в **полном** — ничего не нужно, идёт всё.
+
 ### Вариант A — wget (если HTTPS работает)
 
 Сначала проверьте, что wget не `wget-nossl`:
@@ -121,70 +201,6 @@ pgrep wdttd || echo "OK: wdttd not running"
 
 LuCI **Подключить / Отключить** (v3.6.7+) — через ubus, без зависания на Save.
 
-### Нет трафика в любом режиме (v3.10.0)
-
-Частая причина: `wg-wdtt` поднят, а **NAT/зона firewall** не привязаны (selective раньше не делал `fw4 reload`).
-
-```bash
-/usr/libexec/wdtt/firewall-refresh wg-wdtt
-/usr/libexec/wdtt/doctor
-# смотри: handshake, masquerade, lan→wdtt, endpoint 127.0.0.1:9000
-```
-
-Если `FAIL: нет свежего handshake` — проблема TURN/uplink, не правил:
-`uci get wdtt.globals.uplink_iface; /usr/libexec/wdtt/uplink status`
-
-### Selective: трафик есть, но медленно (v3.10.0)
-
-1. **MTU** — LuCI → MTU **1240**. WG→DTLS→TURN: выше 1280 часто даёт фрагментацию.
-2. **dnsmasq-full** — обязателен для nftset: `apk del dnsmasq && apk add dnsmasq-full`
-3. **flow offloading** — выключить: `uci set firewall.@defaults[0].flow_offloading=0; uci set firewall.@defaults[0].flow_offloading_hw=0; uci commit firewall; /etc/init.d/firewall reload`
-4. **routing v3.10.0+** — MSS clamp + `rp_filter=loose` + firewall-refresh:
-
-```bash
-uclient-fetch -O /usr/libexec/wdtt/routing \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1933519/wdtt-client/files/wdtt-routing
-uclient-fetch -O /usr/libexec/wdtt/firewall-refresh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1933519/wdtt-client/files/wdtt-firewall-refresh
-chmod 755 /usr/libexec/wdtt/routing /usr/libexec/wdtt/firewall-refresh
-/usr/libexec/wdtt/firewall-refresh wg-wdtt
-/usr/libexec/wdtt/routing reload wg-wdtt
-/usr/libexec/wdtt/doctor
-```
-
-### Домены не сохраняются / склеиваются / wdtt.conf пуст (v3.10.0)
-
-Обновление с ПК (без полной переустановки):
-
-```bash
-sh scripts/push-domain-fix.sh root@192.168.10.1
-```
-
-В браузере **Ctrl+F5** → LuCI → Правила → **Принять изменения**.
-
-Ручная запись:
-
-```bash
-/usr/libexec/wdtt/set-domains route1 youtube.com,googlevideo.com
-/usr/libexec/wdtt/doctor
-```
-
-После установки: LuCI → **WDTT VPN** → peer/password/hashes → **VKCalls** → **Правила** → домены → **Принять изменения** → Подключить.
-
-Routing поднимается **авоматически** при `connected`. Проверка:
-
-```bash
-/usr/libexec/wdtt/routing status
-nslookup 2ip.io 127.0.0.1
-nft list set inet wdtt wdtt_route
-```
-
-Если `wdtt_route` пуст — обновите routing-скрипт (v3.6.3+) и перезапустите:
-
-```bash
-/usr/libexec/wdtt/routing reload wg-wdtt
-```
-
 Если jsDelivr и GitHub недоступны с роутера, скопируйте бинарник с ПК:
 
 ```bash
@@ -254,6 +270,72 @@ sh <(uclient-fetch --header="Authorization: Bearer $GITHUB_TOKEN" -q -O - \
 
 Требуется OpenWrt **24.10+** / **25.x** (apk), интернет, ~20 МБ свободного места.
 
+## Диагностика после установки
+
+Первым делом — `/usr/libexec/wdtt/doctor`: он сам чинит конфиг, перезагружает routing и печатает общий статус. Ниже — частные случаи.
+
+### Нет трафика в любом режиме (v3.10.0)
+
+Частая причина: `wg-wdtt` поднят, а **NAT/зона firewall** не привязаны (selective раньше не делал `fw4 reload`).
+
+```bash
+/usr/libexec/wdtt/firewall-refresh wg-wdtt
+/usr/libexec/wdtt/doctor
+# смотри: handshake, masquerade, lan→wdtt, endpoint 127.0.0.1:9000
+```
+
+Если `FAIL: нет свежего handshake` — проблема TURN/uplink, не правил:
+`uci get wdtt.globals.uplink_iface; /usr/libexec/wdtt/uplink status`
+
+### Selective: трафик есть, но медленно (v3.10.0)
+
+1. **MTU** — LuCI → MTU **1240**. WG→DTLS→TURN: выше 1280 часто даёт фрагментацию.
+2. **dnsmasq-full** — обязателен для nftset: `apk del dnsmasq && apk add dnsmasq-full`
+3. **flow offloading** — выключить: `uci set firewall.@defaults[0].flow_offloading=0; uci set firewall.@defaults[0].flow_offloading_hw=0; uci commit firewall; /etc/init.d/firewall reload`
+4. **routing v3.10.0+** — MSS clamp + `rp_filter=loose` + firewall-refresh:
+
+```bash
+uclient-fetch -O /usr/libexec/wdtt/routing \
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1933519/wdtt-client/files/wdtt-routing
+uclient-fetch -O /usr/libexec/wdtt/firewall-refresh \
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1933519/wdtt-client/files/wdtt-firewall-refresh
+chmod 755 /usr/libexec/wdtt/routing /usr/libexec/wdtt/firewall-refresh
+/usr/libexec/wdtt/firewall-refresh wg-wdtt
+/usr/libexec/wdtt/routing reload wg-wdtt
+/usr/libexec/wdtt/doctor
+```
+
+### Домены не сохраняются / склеиваются / wdtt.conf пуст (v3.10.0)
+
+Обновление с ПК (без полной переустановки):
+
+```bash
+sh scripts/push-domain-fix.sh root@192.168.10.1
+```
+
+В браузере **Ctrl+F5** → LuCI → Правила → **Принять изменения**.
+
+Ручная запись:
+
+```bash
+/usr/libexec/wdtt/set-domains route1 youtube.com,googlevideo.com
+/usr/libexec/wdtt/doctor
+```
+
+Routing поднимается **автоматически** при `connected`. Проверка:
+
+```bash
+/usr/libexec/wdtt/routing status
+nslookup 2ip.io 127.0.0.1
+nft list set inet wdtt wdtt_route
+```
+
+Если `wdtt_route` пуст — обновите routing-скрипт (v3.6.3+) и перезапустите:
+
+```bash
+/usr/libexec/wdtt/routing reload wg-wdtt
+```
+
 ## Целевое устройство
 
 **Cudy TR3000 256MB** (и совместимые):
@@ -276,6 +358,42 @@ sh <(uclient-fetch --header="Authorization: Bearer $GITHUB_TOKEN" -q -O - \
 | `wdtt-client` | Go-демон `wdttd` + selective routing |
 | `luci-app-wdtt` | LuCI: туннель, правила, статус, логи |
 
+## Режимы работы
+
+У WDTT **две независимые настройки** режима, и их часто путают. `tunnel_mode` отвечает за то, **как** данные идут до VPS, а `routing_mode` — за то, **какой** трафик в этот туннель попадает. Менять их можно в любых сочетаниях.
+
+### tunnel_mode — транспорт
+
+| `tunnel_mode` | Интерфейс | Как работает | Требования |
+|---------------|-----------|--------------|------------|
+| **`wg`** (по умолчанию) | `wg-wdtt` | WireGuard внутри VK TURN/DTLS. Шифрование WireGuard плюс DTLS | `wireguard-tools`, `kmod-wireguard` |
+| **`raw`** | `tun-wdtt` | Сырые IP-пакеты через TURN с RTP-обфускацией, без WireGuard и DTLS | `kmod-tun`, сервер запущен с `-listen-raw` |
+
+RAW быстрее за счёт отсутствия двойного шифрования, но **работает только если VPS поднят с флагом `-listen-raw`**. Если сервер запущен без него, вы увидите `Ошибка RAW-конфига: … i/o timeout` — это не баг клиента, а отсутствие поддержки на сервере. Подробности — «RAW-режим».
+
+### routing_mode — выбор трафика
+
+| `routing_mode` | Кто решает, что в туннель | Правила WDTT | Когда выбирать |
+|----------------|---------------------------|--------------|----------------|
+| **`external`** (по умолчанию после установки, он же «Podkop») | **Podkop** / sing-box | не используются | Уже стоит Podkop и списки настроены в нём |
+| **`selective`** | WDTT: домены, подсети, URL-списки | используются | Нужен обход без Podkop, своими списками |
+| **`full`** | весь трафик роутера | не используются | Нужно завернуть в туннель абсолютно всё |
+
+Синонимы `external` в UCI: `podkop`, `tunnel`, `tunnel_only`. Если `routing_mode` вообще не задан, клиент падает в `selective`, но в поставляемом `/etc/config/wdtt` явно прописан `external`.
+
+### Как переключить
+
+В LuCI — селектором режима, либо через UCI:
+
+```bash
+uci set wdtt.globals.routing_mode='selective'   # full | selective | external
+uci set wdtt.globals.tunnel_mode='wg'          # wg | raw
+uci commit wdtt
+# затем в LuCI: Отключить → Подключить
+```
+
+Смена `routing_mode` и `tunnel_mode` требует переподключения. А вот правки доменов и правил применяются на живом туннеле — см. ниже.
+
 ## Туннель и правила — как это устроено
 
 **Туннель** (кнопки **Подключить / Отключить**) — это WireGuard `wg-wdtt` и демон `wdttd`. Пока туннель открыт, он живёт отдельно от списка доменов.
@@ -291,26 +409,34 @@ sh <(uclient-fetch --header="Authorization: Bearer $GITHUB_TOKEN" -q -O - \
 
 Режим **полный туннель** — весь трафик через WDTT; секции `rule` не используются.
 
-Режим **external / Podkop** (v3.13.2+, **по умолчанию**) — WDTT только поднимает `wg-wdtt` + firewall/NAT; **что** идёт в туннель решает **Podkop** (sing-box). Правила WDTT не используются.
-
-```bash
-# Проверка связки WDTT + Podkop
-/usr/libexec/wdtt/podkop status
-/usr/libexec/wdtt/doctor
-```
+Режим **external / Podkop** (v3.13.2+, **по умолчанию**) — WDTT только поднимает `wg-wdtt` + firewall/NAT, а выбор трафика делает Podkop; правила WDTT не читаются. Настройка и проверка связки — в разделе «Режим Podkop — кто выбирает трафик».
 
 ## Маршрутизация
 
-По умолчанию режим **selective** — в туннель идут только выбранные ресурсы:
+В режиме **selective** в туннель идут только выбранные ресурсы:
 
 1. **Правила `route`** — домены (через dnsmasq **nftset** → nft sets), подсети, URL-списки
 2. **Правила `exclusion`** — трафик напрямую
 3. **`routing_excluded_ip`** — устройства, которые всегда мимо туннеля (высший приоритет)
 4. **`source_ip`** в правиле — весь трафик выбранного устройства через WDTT
 
-Режим **full** — весь трафик роутера через WDTT.
+```
+Приоритет: routing_excluded_ip > source_ip (full device) > domain/subnet lists
+```
 
-Режим **external** — туннель без маршрутов WDTT:
+Режим **full** — весь трафик роутера через WDTT, секции `rule` не читаются.
+
+Режим **external** — туннель без маршрутов WDTT, выбор трафика отдаётся Podkop, см. следующий раздел.
+
+## Режим Podkop — кто выбирает трафик
+
+Это режим по умолчанию после установки. Разделение обязанностей такое: **WDTT отвечает за канал, Podkop — за выбор трафика**. WDTT поднимает интерфейс (`wg-wdtt`, в RAW — `tun-wdtt`), настраивает NAT и зону firewall — и на этом останавливается. Никаких своих маршрутов и nft-сетов он не создаёт, домены в правилах WDTT в этом режиме не читаются вообще. Что именно завернуть в туннель, решает Podkop через sing-box: его списки, его сервисы, его подписки.
+
+Так удобнее, если Podkop у вас уже настроен: WDTT встаёт на место обычного WireGuard-подключения, и вся привычная логика выбора трафика продолжает работать без изменений.
+
+### Настройка связки
+
+Со стороны WDTT:
 
 ```bash
 uci set wdtt.globals.routing_mode='external'
@@ -318,11 +444,41 @@ uci commit wdtt
 # LuCI: Отключить → Подключить
 ```
 
-Затем в **Podkop** → VPN interface: `wg-wdtt` (как обычный WireGuard: Route Allowed IPs **выкл.**).
+Со стороны Podkop: LuCI → **Podkop** → секция конфигурации:
 
+| Параметр Podkop | Значение |
+|-----------------|----------|
+| Connection type | `VPN` |
+| Interface / VPN interface | `wg-wdtt` (в RAW-режиме — `tun-wdtt`) |
+| Route Allowed IPs | **выключено** |
+
+`Route Allowed IPs` должен быть выключен: иначе Podkop добавит собственные маршруты поверх туннеля и начнёт спорить с WDTT за таблицу маршрутизации. Для Podkop это обычный WireGuard-интерфейс, ничего специфичного для WDTT указывать не нужно.
+
+### Проверка
+
+```bash
+/usr/libexec/wdtt/podkop status
+/usr/libexec/wdtt/podkop hint     # напоминание, что и где выставить
+/usr/libexec/wdtt/doctor
 ```
-Приоритет: routing_excluded_ip > source_ip (full device) > domain/subnet lists
-```
+
+`podkop status` проверяет всю цепочку и говорит, какое звено сломано:
+
+| Строка | Что означает |
+|--------|--------------|
+| `OK: Podkop VPN → WDTT (…)` | Связка собрана правильно |
+| `WARN: routing_mode не external` | WDTT сам рулит трафиком и мешает Podkop |
+| `FAIL: Podkop VPN не указывает на wg-wdtt` | В Podkop не выставлен интерфейс WDTT |
+| `WARN: Podkop не найден` | Пакет не установлен: `apk add podkop` |
+| `WARN: sing-box не запущен` | `/etc/init.d/podkop restart` |
+
+### Если трафик не идёт
+
+Сначала убедитесь, что живо само подключение: `wg show` должен показывать свежий handshake. Пока handshake нет, настройки Podkop ни при чём — проблема в TURN или в VK-ссылках.
+
+Когда handshake есть, а сайты из списков Podkop не открываются, типичных причин три: в Podkop указан не тот интерфейс (проверяется `podkop status`), включён `Route Allowed IPs`, или `routing_mode` остался `selective` и правила WDTT конфликтуют с sing-box.
+
+Заворачивать один и тот же трафик обоими механизмами не нужно. Если хочется управлять списками из LuCI WDTT — переключайтесь на `selective` и выключайте WDTT-интерфейс в Podkop; держать оба режима одновременно смысла нет.
 
 ## OpenWrt 25.12 — пакетный менеджер APK
 
@@ -387,6 +543,7 @@ uci set wdtt.globals.peer='203.0.113.10:56000'
 uci set wdtt.globals.password='your-password'
 uci set wdtt.globals.hashes='abc123'
 uci set wdtt.globals.routing_mode='external'   # или selective / full
+uci set wdtt.globals.tunnel_mode='wg'          # raw — только если VPS с -listen-raw
 uci set wdtt.globals.uplink_iface='auto'
 uci set wdtt.globals.workers='12'
 uci set wdtt.globals.obfs_mode='audio'   # или video — только если VPS принимает PT 96
