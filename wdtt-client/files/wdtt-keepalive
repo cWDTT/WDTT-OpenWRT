@@ -1,0 +1,28 @@
+#!/bin/sh
+# Каждую минуту: если WDTT включён и wg up — починить datapath + seed IP доменов.
+# Cron: * * * * * /usr/libexec/wdtt/keepalive
+
+enabled="$(uci -q get wdtt.globals.enabled 2>/dev/null)"
+[ "$enabled" = "1" ] || exit 0
+
+IFACE="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+IFACE="${IFACE:-wg-wdtt}"
+
+ip link show "$IFACE" >/dev/null 2>&1 || exit 0
+
+if [ -x /usr/libexec/wdtt/datapath ]; then
+	/usr/libexec/wdtt/datapath ensure "$IFACE" >/dev/null 2>&1
+	exit $?
+fi
+
+# fallback
+mode="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+[ "$(uci -q get wdtt.globals.full_tunnel 2>/dev/null)" = "1" ] && mode="full"
+if [ "$mode" = "full" ]; then
+	[ -x /usr/libexec/wdtt/full-tunnel ] && /usr/libexec/wdtt/full-tunnel apply >/dev/null 2>&1
+	exit 0
+fi
+[ -x /usr/libexec/wdtt/routing ] || exit 0
+/usr/libexec/wdtt/routing start "$IFACE" >/dev/null 2>&1 || true
+/usr/libexec/wdtt/routing seed "$IFACE" >/dev/null 2>&1 || true
+exit 0

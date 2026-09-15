@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-wdttd:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goarch: arm64
+            arch: aarch64
+            asset: wdttd-linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Build wdttd
+        working-directory: wdtt-client/src
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          go mod tidy
+          go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME:-dev}" \
+            -o "../../${{ matrix.asset }}" ./cmd/wdttd
+          ls -lh "../../${{ matrix.asset }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build-wdttd
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/wdttd-linux-arm64/wdttd-linux-arm64
+          generate_release_notes: true
+
+      - name: Sync bin/ on main for jsDelivr CDN
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout main
+          mkdir -p bin
+          cp artifacts/wdttd-linux-arm64/wdttd-linux-arm64 bin/wdttd-linux-arm64
+          git add bin/wdttd-linux-arm64
+          git diff --staged --quiet && exit 0
+          git commit -m "chore: sync bin/wdttd-linux-arm64 for jsDelivr (${GITHUB_REF_NAME})"
+          git push origin main

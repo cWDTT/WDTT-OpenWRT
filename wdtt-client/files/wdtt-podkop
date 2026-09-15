@@ -1,0 +1,105 @@
+#!/bin/sh
+# Проверка связки WDTT (external) + Podkop (sing-box).
+# WDTT_PODKOP_VERSION=3.13.1
+
+IFACE="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+IFACE="${IFACE:-wg-wdtt}"
+if [ "$(uci -q get wdtt.globals.tunnel_mode 2>/dev/null)" = "raw" ] && [ "$IFACE" = "wg-wdtt" ]; then
+	IFACE="tun-wdtt"
+fi
+NET_IF="$(uci -q get network.wdtt.device 2>/dev/null)"
+NET_IF="${NET_IF:-$IFACE}"
+MODE="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+
+is_external_mode() {
+	case "$MODE" in
+	external|podkop|tunnel|tunnel_only) return 0 ;;
+	esac
+	return 1
+}
+
+podkop_installed() {
+	[ -f /etc/config/podkop ] || command -v podkop >/dev/null 2>&1
+}
+
+podkop_matches_wdtt() {
+	local sec ct iface vpn_if
+	[ -f /etc/config/podkop ] || return 1
+	for sec in $(uci -q show podkop 2>/dev/null | sed -n "s/^podkop\\.\\([^.=]*\\)=section\$/\\1/p"); do
+		[ -n "$sec" ] || continue
+		ct="$(uci -q get "podkop.${sec}.connection_type" 2>/dev/null)"
+		[ "$ct" = "vpn" ] || continue
+		iface="$(uci -q get "podkop.${sec}.interface" 2>/dev/null)"
+		vpn_if="$(uci -q get "podkop.${sec}.vpn_interface" 2>/dev/null)"
+		[ -n "$iface" ] || iface="$vpn_if"
+		case "$iface" in
+		"$IFACE"|"$NET_IF"|wdtt|wg-wdtt|tun-wdtt)
+			echo "section=${sec} interface=${iface}"
+			return 0
+			;;
+		esac
+	done
+	return 1
+}
+
+do_status() {
+	local ok=1
+
+	echo "wdtt_routing_mode=${MODE:-?}"
+	echo "wdtt_iface=$IFACE"
+	echo "network_wdtt_device=$NET_IF"
+
+	if ! is_external_mode; then
+		echo "WARN: routing_mode не external — для Podkop: uci set wdtt.globals.routing_mode=external"
+		ok=0
+	fi
+
+	if ip link show "$IFACE" >/dev/null 2>&1; then
+		echo "OK: $IFACE up"
+	else
+		echo "FAIL: $IFACE down — LuCI WDTT → Подключить"
+		ok=0
+	fi
+
+	if [ -x /usr/libexec/wdtt/datapath ]; then
+		/usr/libexec/wdtt/datapath status 2>/dev/null | grep -E '^(uci_mode|datapath_ok|state_file|iface_up)=' || true
+	fi
+
+	if ! podkop_installed; then
+		echo "WARN: Podkop не найден — apk/opkg install podkop"
+		ok=0
+	else
+		echo "OK: /etc/config/podkop"
+		match="$(podkop_matches_wdtt)" || match=""
+		if [ -n "$match" ]; then
+			echo "OK: Podkop VPN → WDTT ($match)"
+		else
+			echo "FAIL: Podkop VPN не указывает на $IFACE — connection_type=vpn, interface=$IFACE"
+			ok=0
+		fi
+	fi
+
+	if pgrep -f '[s]ing-box' >/dev/null 2>&1 || pgrep -f '[p]odkop' >/dev/null 2>&1; then
+		echo "OK: sing-box/podkop running"
+	else
+		echo "WARN: sing-box не запущен — /etc/init.d/podkop restart"
+	fi
+
+	[ "$ok" -eq 1 ]
+}
+
+do_hint() {
+	cat <<EOF
+WDTT + Podkop (v3.13.1):
+  LuCI WDTT → Режим «Podkop» → Подключить
+  LuCI Podkop → section → VPN → interface: $IFACE
+  Домены/списки — только в Podkop (sing-box), не в WDTT
+Проверка: /usr/libexec/wdtt/podkop status
+EOF
+}
+
+case "${1:-status}" in
+	status) do_status ;;
+	hint|help) do_hint ;;
+	*) echo "Usage: $0 {status|hint}" >&2; exit 1 ;;
+esac

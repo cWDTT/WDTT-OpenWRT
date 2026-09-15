@@ -1,0 +1,39 @@
+# Профиль Cudy TR3000 256MB — ОПЦИОНАЛЬНЫЙ пример (не ставится install.sh)
+# Скопируйте вручную: cp profiles/cudy-tr3000.example /etc/config/wdtt
+# Затем отредактируйте peer, password, hashes
+
+config globals 'globals'
+	option enabled '0'
+	option peer 'YOUR_VPS_IP:56000'
+	option password 'YOUR_TUNNEL_PASSWORD'
+	option hashes 'YOUR_VK_HASH'
+	option workers '12'
+	option mtu '1240'
+	option routing_mode 'selective'
+	option iface 'wg-wdtt'
+	option captcha_mode 'wv'
+	option vk_auth_mode 'vkcalls'
+
+# Популярные сервисы через WDTT (включите нужные)
+config rule 'youtube'
+	option enabled '1'
+	option type 'route'
+	list domain 'youtube.com'
+	list domain 'googlevideo.com'
+	list domain 'ytimg.com'
+	list domain 'youtu.be'
+	list domain 'ggpht.com'
+
+config rule 'instagram'
+	option enabled '0'
+	option type 'route'
+	list domain 'instagram.com'
+	list domain 'cdninstagram.com'
+
+# Локальная сеть — всегда напрямую
+config rule 'local'
+	option enabled '1'
+	option type 'exclusion'
+	list subnet '192.168.0.0/16'
+	list subnet '10.0.0.0/8'
+	list subnet '172.16.0.0/12'

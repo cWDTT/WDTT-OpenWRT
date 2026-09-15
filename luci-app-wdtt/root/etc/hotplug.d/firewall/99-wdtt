@@ -1,0 +1,29 @@
+#!/bin/sh
+# После fw4 reload table inet wdtt исчезает — восстановить selective.
+# Не трогаем, если идёт firewall-refresh (lock) — иначе гонка и 0 трафика.
+# full/external — маршруты не наши (или их нет).
+
+[ "$ACTION" = "reload" ] || exit 0
+[ -f /var/run/wdtt/routing.mode ] || exit 0
+
+# lock от firewall-refresh / routing do_start
+[ -f /var/run/wdtt/firewall-refresh.lock ] && exit 0
+
+routing_mode="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+case "$routing_mode" in
+	full|external|podkop|tunnel|tunnel_only) exit 0 ;;
+esac
+[ "$(uci -q get wdtt.globals.full_tunnel 2>/dev/null)" = "1" ] && exit 0
+
+# уже selective? не делаем полный reload (dnsmasq restart) — только nft+policy
+iface="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+iface="${iface:-wg-wdtt}"
+
+logger -t wdtt-routing "firewall reload — restore nft/policy on ${iface}"
+# restore: не stop/start целиком (убивает dnsmasq), а лёгкий путь
+if [ -x /usr/libexec/wdtt/routing ]; then
+	/usr/libexec/wdtt/routing restore "$iface" 2>/dev/null \
+		|| /usr/libexec/wdtt/routing reload "$iface" 2>/dev/null
+fi
+
+exit 0

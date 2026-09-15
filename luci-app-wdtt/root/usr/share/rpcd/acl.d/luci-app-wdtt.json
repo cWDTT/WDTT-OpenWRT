@@ -1,0 +1,21 @@
+{
+	"luci-app-wdtt": {
+		"description": "Grant access to WDTT VPN configuration",
+		"read": {
+			"uci": [ "wdtt" ],
+			"ubus": {
+				"wdtt": [ "status", "logs", "routing_info" ]
+			},
+			"file": {
+				"/var/run/wdtt/status.json": [ "read" ],
+				"/var/run/wdtt/wdtt.log": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "wdtt" ],
+			"ubus": {
+				"wdtt": [ "captcha", "connect", "disconnect", "apply_config", "apply_rules", "import_uri" ]
+			}
+		}
+	}
+}

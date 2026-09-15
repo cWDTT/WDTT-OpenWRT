@@ -1,0 +1,123 @@
+#!/bin/sh
+# Resolve WDTT uplink (VK/TURN bypass + hotplug) from UCI wdtt.globals.uplink_iface
+
+wdtt_uplink_setting() {
+	local v
+	v="$(uci -q get wdtt.globals.uplink_iface 2>/dev/null)"
+	v="${v:-auto}"
+	printf '%s' "$v"
+}
+
+wdtt_net_is_netdev() {
+	local dev="$1"
+	[ -n "$dev" ] && [ -d "/sys/class/net/$dev" ]
+}
+
+wdtt_uplink_kernel_dev() {
+	local iface="$1" dev ref sec
+
+	[ -n "$iface" ] || return 1
+
+	case "$iface" in
+		auto|"")
+			ip route show default 2>/dev/null | awk 'NR==1 && /default/ {print $5; exit}'
+			return 0
+			;;
+	esac
+
+	if command -v ifstatus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+		dev="$(ifstatus "$iface" 2>/dev/null | jsonfilter -e '@["l3_device"]' 2>/dev/null)"
+		wdtt_net_is_netdev "$dev" && printf '%s' "$dev" && return 0
+		dev="$(ifstatus "$iface" 2>/dev/null | jsonfilter -e '@["device"]' 2>/dev/null)"
+		wdtt_net_is_netdev "$dev" && printf '%s' "$dev" && return 0
+	fi
+
+	dev="$(uci -q get "network.${iface}.ifname" 2>/dev/null)"
+	wdtt_net_is_netdev "$dev" && printf '%s' "$dev" && return 0
+
+	ref="$(uci -q get "network.${iface}.device" 2>/dev/null)"
+	case "$ref" in
+		@*)
+			sec="${ref#@}"
+			dev="$(uci -q get "network.${sec}.name" 2>/dev/null)"
+			wdtt_net_is_netdev "$dev" && printf '%s' "$dev" && return 0
+			;;
+		*)
+			wdtt_net_is_netdev "$ref" && printf '%s' "$ref" && return 0
+			;;
+	esac
+
+	wdtt_net_is_netdev "$iface" && printf '%s' "$iface" && return 0
+	return 1
+}
+
+wdtt_uplink_device() {
+	local uplink="$1" dev
+
+	[ -n "$uplink" ] || uplink="$(wdtt_uplink_setting)"
+	dev="$(wdtt_uplink_kernel_dev "$uplink")" || return 1
+	[ -n "$dev" ] && printf '%s' "$dev"
+}
+
+wdtt_uplink_gateway() {
+	local uplink="$1" dev gw
+
+	[ -n "$uplink" ] || uplink="$(wdtt_uplink_setting)"
+	dev="$(wdtt_uplink_kernel_dev "$uplink")" || return 1
+
+	gw="$(ip route show default dev "$dev" 2>/dev/null | awk '/via/ {print $3; exit}')"
+	[ -n "$gw" ] && printf '%s' "$gw" && return 0
+
+	if command -v ifstatus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+		gw="$(ifstatus "$uplink" 2>/dev/null | jsonfilter -e '@["route"][0]["nexthop"]' 2>/dev/null)"
+		[ -n "$gw" ] && printf '%s' "$gw" && return 0
+	fi
+
+	gw="$(ip route show dev "$dev" 2>/dev/null | awk '/via/ {print $3; exit}')"
+	[ -n "$gw" ] && printf '%s' "$gw" && return 0
+
+	# LTE point-to-point: маршрут только через dev, без via
+	if ip route show default dev "$dev" 2>/dev/null | grep -q '^default '; then
+		printf '%s' "$dev"
+		return 0
+	fi
+
+	return 1
+}
+
+wdtt_uplink_ifname_match() {
+	local uplink="$1" iface="$2" device="$3" want
+
+	[ -n "$uplink" ] || uplink="$(wdtt_uplink_setting)"
+	case "$uplink" in
+		auto|"")
+			case "$iface" in wan|wwan) return 0 ;; esac
+			return 1
+			;;
+	esac
+	[ "$iface" = "$uplink" ] && return 0
+	want="$(wdtt_uplink_kernel_dev "$uplink" 2>/dev/null)" || return 1
+	[ -n "$device" ] && [ "$device" = "$want" ] && return 0
+	[ -n "$want" ] && [ "$want" = "$iface" ] && return 0
+	return 1
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+	setting) wdtt_uplink_setting ;;
+	device) wdtt_uplink_device "$2" ;;
+	gateway) wdtt_uplink_gateway "$2" ;;
+	match)
+		wdtt_uplink_ifname_match "$(wdtt_uplink_setting)" "$2" "$3" && exit 0
+		exit 1
+		;;
+	status)
+		echo "uplink_iface=$(wdtt_uplink_setting)"
+		echo "uplink_dev=$(wdtt_uplink_device 2>/dev/null || echo unknown)"
+		echo "uplink_gw=$(wdtt_uplink_gateway 2>/dev/null || echo unknown)"
+		;;
+	*)
+		echo "Usage: $0 {setting|device|gateway|match|status} [args]" >&2
+		exit 1
+		;;
+esac

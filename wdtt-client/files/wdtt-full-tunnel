@@ -1,0 +1,88 @@
+#!/bin/sh
+# Full tunnel: default routes via WireGuard + NAT for LAN clients (OpenWrt fw4)
+
+IFACE="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+IFACE="${IFACE:-wg-wdtt}"
+if [ "$(uci -q get wdtt.globals.tunnel_mode 2>/dev/null)" = "raw" ] && [ "$IFACE" = "wg-wdtt" ]; then
+	IFACE="tun-wdtt"
+fi
+STATE_DIR="/var/run/wdtt"
+
+log() { logger -t wdtt-full-tunnel "$*"; }
+
+full_route_apply() {
+	local cidr rc=0
+	for cidr in 0.0.0.0/1 128.0.0.0/1; do
+		if ip route replace "$cidr" dev "$IFACE" 2>/dev/null; then
+			log "route $cidr dev $IFACE"
+		elif ip route add "$cidr" dev "$IFACE" 2>/dev/null; then
+			log "route add $cidr dev $IFACE"
+		else
+			log "WARN: route $cidr failed"
+			rc=1
+		fi
+	done
+	return "$rc"
+}
+
+do_apply() {
+	local mode
+
+	mode="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+	[ "$mode" = "full" ] || {
+		log "skip: routing_mode=${mode:-?} (not full)"
+		return 0
+	}
+
+	if ! ip link show "$IFACE" >/dev/null 2>&1; then
+		log "WARN: $IFACE down — full tunnel deferred"
+		return 1
+	fi
+
+	/usr/libexec/wdtt/routing stop 2>/dev/null || true
+	mkdir -p "$STATE_DIR"
+	printf '%s\n' "full" > "$STATE_DIR/routing.mode"
+
+	full_route_apply || true
+
+	# NAT/zone/forward + ip_forward + rp_filter (общий скрипт для selective и full)
+	if [ -x /usr/libexec/wdtt/firewall-refresh ]; then
+		/usr/libexec/wdtt/firewall-refresh "$IFACE" >/dev/null 2>&1 || true
+	else
+		sysctl -qw net.ipv4.ip_forward=1 2>/dev/null
+		sysctl -qw net.ipv4.conf.all.forwarding=1 2>/dev/null
+		[ -x /etc/firewall.wdtt ] && /etc/firewall.wdtt
+		fw4 reload 2>/dev/null || /etc/init.d/firewall reload 2>/dev/null
+	fi
+
+	log "full tunnel applied on $IFACE"
+	return 0
+}
+
+do_stop() {
+	ip route del 0.0.0.0/1 dev "$IFACE" 2>/dev/null
+	ip route del 128.0.0.0/1 dev "$IFACE" 2>/dev/null
+	rm -f "$STATE_DIR/routing.mode"
+	log "full tunnel routes removed"
+}
+
+case "$1" in
+	apply|start)
+		do_apply
+		;;
+	stop)
+		do_stop
+		;;
+	status)
+		echo "iface=$IFACE"
+		echo "routing_mode=$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+		echo "state_file=$(cat "$STATE_DIR/routing.mode" 2>/dev/null || echo missing)"
+		ip route show 0.0.0.0/1 2>/dev/null || echo "route 0.0.0.0/1: missing"
+		ip route show 128.0.0.0/1 2>/dev/null || echo "route 128.0.0.0/1: missing"
+		nft list chain inet fw4 srcnat 2>/dev/null | grep -F "$IFACE" || echo "masq: missing"
+		;;
+	*)
+		echo "Usage: $0 {apply|stop|status} [iface]" >&2
+		exit 1
+		;;
+esac

@@ -1,0 +1,12 @@
+#!/bin/sh
+# WDTT firewall hooks (fw4 / nftables, OpenWrt 24.10+ / 25.x)
+
+WDEV="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+WDEV="${WDEV:-wg-wdtt}"
+
+# MASQUERADE для трафика через WDTT-интерфейс
+nft list chain inet fw4 srcnat 2>/dev/null | grep -q "oifname \"$WDEV\"" && exit 0
+
+nft add rule inet fw4 srcnat oifname "$WDEV" masquerade comment \"wdtt-nat\" 2>/dev/null
+
+exit 0

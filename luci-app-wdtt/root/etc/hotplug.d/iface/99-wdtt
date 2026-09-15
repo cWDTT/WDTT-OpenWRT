@@ -1,0 +1,24 @@
+#!/bin/sh
+# Restart WDTT when configured uplink interface comes up
+
+[ "$ACTION" = "ifup" ] || exit 0
+
+enabled="$(uci -q get wdtt.globals.enabled 2>/dev/null)"
+[ "$enabled" = "1" ] || exit 0
+
+if [ -x /usr/libexec/wdtt/uplink ]; then
+	/usr/libexec/wdtt/uplink match "$INTERFACE" "$DEVICE" || exit 0
+else
+	case "$INTERFACE" in
+	wan|wwan) ;;
+	*) exit 0 ;;
+	esac
+fi
+
+/etc/init.d/wdtt restart
+(
+	sleep 5
+	[ -x /usr/libexec/wdtt/datapath ] && /usr/libexec/wdtt/datapath ensure
+) >/dev/null 2>&1 &
+
+exit 0

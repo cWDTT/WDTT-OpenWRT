@@ -1,0 +1,995 @@
+#!/bin/sh
+# WDTT selective routing — OpenWrt 25 / fw4
+# WDTT_ROUTING_VERSION=3.13.2
+# dnsmasq nftset → nft sets → fwmark → ip rule table 100 → wg-wdtt
+
+. /lib/functions.sh
+[ -f /usr/libexec/wdtt/domain-lib.sh ] && . /usr/libexec/wdtt/domain-lib.sh
+
+MARK=0x777474
+TABLE=100
+IFACE="${2:-wg-wdtt}"
+
+NFT_TABLE=wdtt
+NFT_SET_ROUTE=wdtt_route
+NFT_SET_EXCL=wdtt_excl
+NFT_SET_SRC=wdtt_src
+NFT_FAMILY=inet
+
+DNSMASQ_SNIPPET=/tmp/dnsmasq.d/wdtt.conf
+STATE_DIR=/var/run/wdtt
+NFT_HOOK="$STATE_DIR/wdtt.nft"
+NFT_HOOK_LEGACY="/etc/nftables.d/99-wdtt.nft"
+
+log() { logger -t wdtt-routing "$*"; }
+
+ensure_dnsmasq_confdir() {
+	[ -x /sbin/uci ] || return 0
+	uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1 || return 0
+	if ! uci -q get dhcp.@dnsmasq[0].confdir 2>/dev/null | grep -qF '/tmp/dnsmasq.d'; then
+		uci -q add_list dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d' 2>/dev/null
+		uci -q commit dhcp 2>/dev/null
+		log "dnsmasq confdir: added /tmp/dnsmasq.d"
+	fi
+}
+
+check_dnsmasq_nftset() {
+	if ! command -v dnsmasq >/dev/null 2>&1; then
+		log "ERROR: dnsmasq not found"
+		echo "ERROR: dnsmasq not found" >&2
+		return 1
+	fi
+	# ВАЖНО: не 'grep -qi nftset' — оно матчит 'no-nftset' и даёт ложный OK.
+	# Разбиваем опции по словам и ищем точное слово 'nftset'.
+	if dnsmasq --version 2>/dev/null | tr ' ,' '\n\n' | grep -qx 'nftset'; then
+		return 0
+	fi
+	log "ERROR: dnsmasq без nftset — нужен dnsmasq-full (apk del dnsmasq; apk add dnsmasq-full)"
+	echo "ERROR: dnsmasq-full required for selective routing (nftset)" >&2
+	echo "  apk update && apk del dnsmasq && apk add dnsmasq-full" >&2
+	return 1
+}
+
+_resolve_via_dnsmasq() {
+	local domain="$1"
+	if command -v dig >/dev/null 2>&1; then
+		dig +time=2 +tries=1 +short "@127.0.0.1" "$domain" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+		return 0
+	fi
+	nslookup "$domain" 127.0.0.1 2>/dev/null | awk '/^Address: / { print $2 } /^Address [0-9]+: / { print $3 }' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+_resolve_via_public() {
+	local domain="$1" dns
+	for dns in 1.1.1.1 8.8.8.8; do
+		if command -v dig >/dev/null 2>&1; then
+			dig +time=2 +tries=1 +short "@$dns" "$domain" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && return 0
+		fi
+	done
+	return 1
+}
+
+# Кладём IP напрямую в nft — не ждём DNS клиентов (DoH иначе оставляет set пустым).
+seed_domain_ips_into_nft() {
+	local domain="$1" ip count=0
+	domain="$(normalize_domain "$domain")"
+	[ -n "$domain" ] || return 0
+	case "$domain" in
+	*.*) ;;
+	*) return 0 ;;
+	esac
+
+	# Сначала через локальный dnsmasq (попутно прогреет nftset), потом публичный DNS
+	for ip in $(_resolve_via_dnsmasq "$domain") $(_resolve_via_public "$domain"); do
+		case "$ip" in
+		0.*|127.*|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) continue ;;
+		esac
+		if nft_add_one "$NFT_SET_ROUTE" "$ip"; then
+			count=$((count + 1))
+		fi
+	done
+	[ "$count" -gt 0 ] && log "seed: ${domain} → ${count} IP(s) in ${NFT_SET_ROUTE}"
+	return 0
+}
+
+collect_route_domains() {
+	local line domain sec dl
+	# из dnsmasq snippet
+	if [ -f "$DNSMASQ_SNIPPET" ]; then
+		while read -r line; do
+			domain="${line#nftset=/}"
+			domain="${domain%%/*}"
+			[ -n "$domain" ] && echo "$domain"
+		done <<EOF
+$(grep '^nftset=' "$DNSMASQ_SNIPPET" 2>/dev/null)
+EOF
+	fi
+	# из UCI (на случай пустого conf)
+	if [ -x /sbin/uci ]; then
+		for sec in $(uci -q show wdtt 2>/dev/null | sed -n 's/^wdtt\.\([^.=]*\)=rule$/\1/p'); do
+			[ "$(uci -q get "wdtt.${sec}.type" 2>/dev/null)" = "exclusion" ] && continue
+			[ "$(uci -q get "wdtt.${sec}.enabled" 2>/dev/null)" = "0" ] && continue
+			dl="$(uci -q get "wdtt.${sec}.domain_list" 2>/dev/null)"
+			[ -n "$dl" ] && foreach_domain_text "$dl" echo
+		done
+	fi
+}
+
+# Главный фикс selective «почти нет трафика»: наполнить wdtt_route IP доменов.
+seed_nft_route_ips() {
+	local domain warmed=0 seen="" d
+	nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 || return 1
+
+	for domain in $(collect_route_domains | awk 'NF && !seen[$0]++'); do
+		d="$(normalize_domain "$domain")"
+		[ -n "$d" ] || continue
+		is_ghost_domain "$d" && continue
+		seed_domain_ips_into_nft "$d"
+		warmed=$((warmed + 1))
+	done
+	log "seed: processed ${warmed} domain(s) into ${NFT_SET_ROUTE}"
+	return 0
+}
+
+warmup_nftset_domains() {
+	# совместимость: старое имя → новый seed
+	seed_nft_route_ips
+}
+
+NFTSET_SUFFIX="4#${NFT_FAMILY}#${NFT_TABLE}#"
+
+normalize_domain() {
+	local d="$1"
+	d="${d#https://}"
+	d="${d#http://}"
+	d="${d%%/*}"
+	d="${d%/}"
+	# диапазоны, а не [:upper:]/[:lower:] — busybox tr калечит домен классами
+	printf '%s' "$d" | tr 'A-Z' 'a-z'
+}
+
+is_ghost_domain() {
+	case "$1" in
+	2iw.*|*.2iw.*|*2iw.rl|*2iw.io) return 0 ;;
+	yoltlbe.com|*.yoltlbe.com|yoltlbe) return 0 ;;
+	esac
+	return 1
+}
+
+# busybox-safe: разбор строки только через parameter expansion.
+# Никаких for..in / многосимвольного tr / зависимости от IFS.
+foreach_domain_text() {
+	local text="$1" callback="$2" work item d
+
+	# все разделители → запятая (по одному символу)
+	work="$(printf '%s' "$text" | tr ';' ',')"
+	work="$(printf '%s' "$work" | tr ' ' ',')"
+	work="$(printf '%s' "$work" | tr '\t' ',')"
+	work="$(printf '%s' "$work" | tr '\n' ',')"
+	work="$(printf '%s' "$work" | tr '\r' ',')"
+
+	while [ -n "$work" ]; do
+		case "$work" in
+		*,*) item="${work%%,*}"; work="${work#*,}" ;;
+		*)   item="$work"; work="" ;;
+		esac
+		[ -n "$item" ] || continue
+		d="$(normalize_domain "$item")"
+		[ -n "$d" ] || continue
+		is_ghost_domain "$d" && continue
+		case "$d" in
+		*.*) "$callback" "$d" ;;
+		esac
+	done
+}
+
+append_domains_from_text() {
+	local text="$1" norm
+	# normalize — best-effort; если вернула пусто (busybox-квирк), берём raw.
+	if type normalize_domain_list_text >/dev/null 2>&1; then
+		norm="$(normalize_domain_list_text "$text")"
+		[ -n "$norm" ] && text="$norm"
+	fi
+	foreach_domain_text "$text" append_domain_nftset_with_related
+}
+
+rule_is_enabled() {
+	local section="$1" enabled
+	enabled="$(uci -q get wdtt.${section}.enabled)"
+	[ "$enabled" = "0" ] && return 1
+	return 0
+}
+
+# youtube.com без CDN = сайт есть, видео мимо туннеля (googlevideo.com и т.п.).
+append_related_route_domains() {
+	local domain="$1" d
+	case "$domain" in
+	youtube.com|*.youtube.com|youtu.be|*.youtu.be|youtube-nocookie.com|*.youtube-nocookie.com)
+		for d in youtu.be youtube-nocookie.com googlevideo.com ytimg.com ggpht.com \
+			gvt1.com youtubei.googleapis.com jnn-pa.googleapis.com; do
+			append_domain_nftset "$d"
+		done
+		log "expand: ${domain} → YouTube CDN (googlevideo/ytimg/…)"
+		;;
+	esac
+}
+
+append_domain_nftset_with_related() {
+	local domain="$1"
+	append_domain_nftset "$domain"
+	domain="$(normalize_domain "$domain")"
+	[ -n "$domain" ] || return 0
+	append_related_route_domains "$domain"
+}
+
+append_domain_nftset() {
+	local domain="$1"
+	domain="$(normalize_domain "$domain")"
+	case "$domain" in
+	*" "*|*/*/*|list\ domain*|option\ domain*) return 0 ;;
+	2iw.*|*.2iw.*|*2iw.rl|*2iw.io|yoltlbe.com|*.yoltlbe.com|yoltlbe)
+		log "WARN: skip ghost domain: ${domain}"; return 0 ;;
+	esac
+	case "$domain" in
+	*.*) ;;
+	*) log "WARN: skip invalid domain: ${domain}"; return 0 ;;
+	esac
+	if type is_glued_domain >/dev/null 2>&1 && is_glued_domain "$domain"; then
+		log "WARN: skip glued domain blob: ${domain}"
+		return 0
+	fi
+	[ -n "$domain" ] || return 0
+	grep -qF "nftset=/${domain}/" "$DNSMASQ_SNIPPET" 2>/dev/null && return 0
+	echo "nftset=/${domain}/${NFTSET_SUFFIX}${NFT_SET_ROUTE}" >> "$DNSMASQ_SNIPPET"
+	log "nftset domain: ${domain}"
+}
+
+# Разбор UCI list: domain[0], domain[1] или 'a.com' 'b.com' в одной строке
+_split_uci_values() {
+	local raw="$1" callback="$2" part
+	[ -n "$raw" ] || return 0
+	raw="$(echo "$raw" | tr "'" " ")"
+	for part in $raw; do
+		[ -n "$part" ] && "$callback" "$part"
+	done
+}
+
+uci_foreach_list() {
+	local section="$1" option="$2" callback="$3" i=0 val found=0 line
+
+	while val="$(uci -q get wdtt.${section}.${option}[$i] 2>/dev/null)" && [ -n "$val" ]; do
+		"$callback" "$val"
+		found=1
+		i=$((i + 1))
+	done
+
+	if [ "$found" -eq 0 ]; then
+		uci -q show "wdtt.${section}" 2>/dev/null | grep -E "^wdtt\.${section}\.${option}(\[|[=])" | while read -r line; do
+			val="${line#*=}"
+			val="${val#\'}"
+			val="${val%\'}"
+			[ -n "$val" ] && "$callback" "$val"
+		done
+		found=1
+	fi
+
+	if [ "$found" -eq 0 ]; then
+		val="$(uci -q get wdtt.${section}.${option} 2>/dev/null)"
+		_split_uci_values "$val" "$callback"
+	fi
+}
+
+append_url_domains_raw() {
+	local list_url="$1" domain tmp
+
+	[ -n "$list_url" ] || return 0
+	case "$list_url" in
+		http://*|https://*) ;;
+		*)
+			log "skip invalid list_url: ${list_url}"
+			return 0
+			;;
+	esac
+	log "list_url fetch: ${list_url}"
+	tmp="$(mktemp /tmp/wdtt-list.XXXXXX)"
+	wget -qO "$tmp" "$list_url" 2>/dev/null || {
+		rm -f "$tmp"
+		return 0
+	}
+	while read -r domain; do
+		domain="${domain%%#*}"
+		domain="$(echo "$domain" | tr -d ' \t\r\n')"
+		append_domain_nftset "$domain"
+	done < "$tmp"
+	rm -f "$tmp"
+}
+
+uci_line_value() {
+	local line="$1" val
+	val="${line#*\'}"
+	if [ "$val" != "$line" ]; then
+		val="${val%%\'*}"
+		printf '%s' "$val"
+		return 0
+	fi
+	val="${line#*\"}"
+	val="${val%%\"*}"
+	printf '%s' "$val"
+}
+
+# Надёжный разбор list domain (не uci_line_value — ломался на некоторых конфигах)
+parse_list_domain_line() {
+	local line="$1" val
+	case "$line" in
+		list\ domains\ *)
+			val="${line#list domains}"
+			;;
+		list\ domain\ *)
+			val="${line#list domain}"
+			;;
+		*) return 1 ;;
+	esac
+	val="$(trim_line "$val")"
+	case "$val" in
+		\'*\')
+			val="${val#\'}"
+			val="${val%\'}"
+			;;
+		\"*\")
+			val="${val#\"}"
+			val="${val%\"}"
+			;;
+	esac
+	[ -n "$val" ] || return 1
+	printf '%s' "$val"
+}
+
+# Legacy option domain — источник ghost 2iw.io / yoltlbe.com; удаляем из файла
+remove_legacy_option_domains() {
+	local tmp changed=0
+	[ -r /etc/config/wdtt ] || return 0
+	grep -qE '^[[:space:]]*option domain[[:space:]]' /etc/config/wdtt 2>/dev/null && changed=1
+	grep -qE '^[[:space:]]*option domains[[:space:]]' /etc/config/wdtt 2>/dev/null && changed=1
+	[ "$changed" -eq 1 ] || return 0
+	tmp="$(mktemp /tmp/wdtt-cfg.XXXXXX)"
+	grep -Ev '^[[:space:]]*option domain[[:space:]]' /etc/config/wdtt \
+		| grep -Ev '^[[:space:]]*option domains[[:space:]]' > "$tmp" \
+		|| { rm -f "$tmp"; return 0; }
+	mv "$tmp" /etc/config/wdtt
+	log "removed legacy option domain lines from /etc/config/wdtt"
+}
+
+uci_wdtt_parse_ok() {
+	uci show wdtt 2>&1 | grep -qi 'parse error' && return 1
+	return 0
+}
+
+trim_line() {
+	local line="$1"
+	line="${line#"${line%%[![:space:]]*}"}"
+	line="${line%"${line##*[![:space:]]}"}"
+	printf '%s' "$line"
+}
+
+# Синхронизация uci list domain ← /etc/config/wdtt (ghost indices: 2iw.io, yoltlbe.com)
+_sync_one_rule_domains() {
+	local section="$1" domains="$2" first d uci0
+
+	first="${domains#"${domains%%[![:space:]]*}"}"
+	first="${first%% *}"
+	[ -n "$first" ] || return 0
+	uci0="$(uci -q get wdtt.${section}.domain[0] 2>/dev/null)"
+	[ "$uci0" = "$first" ] && return 0
+
+	log "sync uci ${section}.domain from config file (was: ${uci0:-empty})"
+	uci -q delete "wdtt.${section}.domain" 2>/dev/null
+	for d in $domains; do
+		[ -n "$d" ] && uci -q add_list "wdtt.${section}.domain=$d"
+	done
+	uci -q commit wdtt 2>/dev/null
+}
+
+sync_wdtt_domains_uci() {
+	local line section="" domains="" count=0 in_rule=0 val
+
+	[ -x /sbin/uci ] || return 0
+	[ -r /etc/config/wdtt ] || return 0
+	uci_wdtt_parse_ok || {
+		log "WARN: uci wdtt parse error — skip uci sync (file-only dnsmasq)"
+		return 0
+	}
+
+	while read -r line || [ -n "$line" ]; do
+		line="$(trim_line "$line")"
+		case "$line" in
+			config\ rule\ *)
+				[ -n "$section" ] && [ "$count" -gt 0 ] && _sync_one_rule_domains "$section" "$domains"
+				section="${line#config rule }"
+				section="${section#\'}"; section="${section%%\'*}"
+				if [ "$section" = "${line#config rule }" ]; then
+					section="${section#\"}"; section="${section%%\"*}"
+				fi
+				section="${section%% *}"
+				domains=""; count=0; in_rule=1
+				continue
+				;;
+			config\ *)
+				[ -n "$section" ] && [ "$count" -gt 0 ] && _sync_one_rule_domains "$section" "$domains"
+				section=""; domains=""; count=0; in_rule=0
+				continue
+				;;
+		esac
+		[ "$in_rule" -eq 1 ] || continue
+		case "$line" in
+			list\ domain|list\ domain\ *|list\ domains|list\ domains\ *)
+				val="$(parse_list_domain_line "$line")" || continue
+				domains="$domains $val"
+				count=$((count + 1))
+				;;
+		esac
+	done < /etc/config/wdtt
+	[ -n "$section" ] && [ "$count" -gt 0 ] && _sync_one_rule_domains "$section" "$domains"
+}
+
+# domain_list (LuCI TextValue) + legacy list domain из /etc/config/wdtt
+build_dnsmasq() {
+	local line section="" type="route" enabled="1" in_rule=0 val n=0
+
+	if type wdtt_sanitize_all_rule_domain_lists >/dev/null 2>&1; then
+		wdtt_sanitize_all_rule_domain_lists
+	fi
+
+	mkdir -p "$(dirname "$DNSMASQ_SNIPPET")"
+	: > "$DNSMASQ_SNIPPET"
+
+	[ -r /etc/config/wdtt ] || {
+		log "ERROR: /etc/config/wdtt missing"
+		return 1
+	}
+
+	remove_legacy_option_domains
+
+	# НЕ вызываем sync_wdtt_domains_uci — uci commit при parse error ломает файл/ghost domains
+
+	while read -r line || [ -n "$line" ]; do
+		line="$(trim_line "$line")"
+		case "$line" in
+			""|\#*) continue ;;
+			config\ rule\ *)
+				section="${line#config rule }"
+				section="${section#\'}"; section="${section%%\'*}"
+				if [ "$section" = "${line#config rule }" ]; then
+					section="${section#\"}"; section="${section%%\"*}"
+				fi
+				section="${section%% *}"
+				type="route"
+				enabled="1"
+				in_rule=1
+				log "rule ${section}: scan /etc/config/wdtt"
+				continue
+				;;
+			config\ *)
+				in_rule=0
+				section=""
+				continue
+				;;
+		esac
+
+		[ "$in_rule" -eq 1 ] || continue
+
+		case "$line" in
+			option\ type\ *)
+				type="$(uci_line_value "$line")"
+				;;
+			option\ enabled\ *)
+				enabled="$(uci_line_value "$line")"
+				;;
+			option\ domain_list\ *)
+				[ "$type" = "route" ] || continue
+				[ "$enabled" = "0" ] && continue
+				val="$(uci_line_value "$line")"
+				log "rule ${section}: raw domain_list='${val}'"
+				# append_domains_from_text сам нормализует и имеет фоллбэк на raw
+				append_domains_from_text "$val"
+				;;
+			list\ domain|list\ domain\ *|list\ domains|list\ domains\ *)
+				[ "$type" = "route" ] || continue
+				[ "$enabled" = "0" ] && continue
+				val="$(parse_list_domain_line "$line")" || continue
+				if type normalize_domain_list_text >/dev/null 2>&1; then
+					val="$(normalize_domain_list_text "$val")"
+				fi
+				append_domains_from_text "$val"
+				;;
+			option\ domain|option\ domains*)
+				log "WARN: ignoring legacy option domain (use domain_list in LuCI)"
+				continue
+				;;
+			list\ domain_list|list\ domain_list\ *)
+				[ "$type" = "route" ] || continue
+				[ "$enabled" = "0" ] && continue
+				val="$(uci_line_value "$line")"
+				if type normalize_domain_list_text >/dev/null 2>&1; then
+					val="$(normalize_domain_list_text "$val")"
+				fi
+				append_domains_from_text "$val"
+				;;
+			option\ list_url\ *)
+				[ "$type" = "route" ] || continue
+				[ "$enabled" = "0" ] && continue
+				val="$(uci_line_value "$line")"
+				append_url_domains_raw "$val"
+				;;
+		esac
+	done < /etc/config/wdtt
+
+	n=$(grep -c '^nftset=' "$DNSMASQ_SNIPPET" 2>/dev/null) || n=0
+
+	# Фоллбэк: файл-парсер дал 0, но UCI знает домены (list/option — неважно).
+	if [ "$n" -eq 0 ] && uci_wdtt_parse_ok; then
+		build_dnsmasq_from_uci
+		n=$(grep -c '^nftset=' "$DNSMASQ_SNIPPET" 2>/dev/null) || n=0
+		[ "$n" -gt 0 ] && log "dnsmasq: домены прочитаны через UCI (fallback)"
+	fi
+
+	log "dnsmasq: ${n} nftset domain(s) in $DNSMASQ_SNIPPET"
+	if [ "$n" -eq 0 ]; then
+		log "WARN: no domains in wdtt.conf"
+	fi
+	return 0
+}
+
+# Чтение доменов напрямую из UCI (устойчиво к формату list/option в файле).
+build_dnsmasq_from_uci() {
+	local sec t en dl url
+	[ -x /sbin/uci ] || return 0
+
+	for sec in $(uci -q show wdtt 2>/dev/null | sed -n 's/^wdtt\.\([^.=]*\)=rule$/\1/p'); do
+		t="$(uci -q get "wdtt.${sec}.type" 2>/dev/null)"; t="${t:-route}"
+		en="$(uci -q get "wdtt.${sec}.enabled" 2>/dev/null)"; en="${en:-1}"
+		[ "$t" = "route" ] || continue
+		[ "$en" = "0" ] && continue
+
+		dl="$(uci -q get "wdtt.${sec}.domain_list" 2>/dev/null)"
+		[ -n "$dl" ] && append_domains_from_text "$dl"
+
+		url="$(uci -q get "wdtt.${sec}.list_url" 2>/dev/null)"
+		[ -n "$url" ] && append_url_domains_raw "$url"
+	done
+}
+
+nft_add_one() {
+	local setname="$1" elem="$2"
+	[ -n "$elem" ] || return 0
+	nft add element "$NFT_FAMILY" "$NFT_TABLE" "$setname" "{ $elem }" 2>/dev/null
+}
+
+nft_add_route_subnet() { nft_add_one "$NFT_SET_ROUTE" "$1"; }
+nft_add_excl_subnet()  { nft_add_one "$NFT_SET_EXCL" "$1"; }
+nft_add_src_ip()       { nft_add_one "$NFT_SET_SRC" "$1"; }
+nft_add_excl_ip()      { nft_add_one "$NFT_SET_EXCL" "$1"; }
+
+populate_nft_static() {
+	uci_foreach_list globals routing_excluded_ip nft_add_excl_ip
+	uci_foreach_list globals routing_excluded_ips nft_add_excl_ip
+	config_foreach populate_rule_nft rule
+}
+
+populate_rule_nft() {
+	local section="$1" type
+
+	type="$(uci -q get wdtt.${section}.type)"
+	rule_is_enabled "$section" || return 0
+
+	case "$type" in
+		route)
+			uci_foreach_list "$section" subnet nft_add_route_subnet
+			uci_foreach_list "$section" subnets nft_add_route_subnet
+			uci_foreach_list "$section" source_ip nft_add_src_ip
+			uci_foreach_list "$section" fully_routed_ip nft_add_src_ip
+			;;
+		exclusion)
+			uci_foreach_list "$section" subnet nft_add_excl_subnet
+			uci_foreach_list "$section" subnets nft_add_excl_subnet
+			;;
+	esac
+}
+
+# MSS = MTU туннеля - 40 (IPv4 20 + TCP 20). Без этого selective-трафик через
+# wg-wdtt фрагментируется/попадает в PMTU blackhole → медленно.
+wg_mss() {
+	local mtu
+	mtu="$(cat "/sys/class/net/${IFACE}/mtu" 2>/dev/null)"
+	[ -n "$mtu" ] || mtu="$(uci -q get wdtt.globals.mtu 2>/dev/null)"
+	[ -n "$mtu" ] || mtu=1240
+	echo $((mtu - 40))
+}
+
+write_nft_hook() {
+	local mss
+	mss="$(wg_mss)"
+	mkdir -p "$STATE_DIR"
+	cat > "$NFT_HOOK" <<EOF
+table ${NFT_FAMILY} ${NFT_TABLE} {
+	set ${NFT_SET_ROUTE} {
+		type ipv4_addr
+		flags interval
+	}
+
+	set ${NFT_SET_EXCL} {
+		type ipv4_addr
+		flags interval
+	}
+
+	set ${NFT_SET_SRC} {
+		type ipv4_addr
+	}
+
+	chain prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+		ip saddr @${NFT_SET_EXCL} return
+		ip daddr @${NFT_SET_EXCL} return
+		ip saddr @${NFT_SET_SRC} meta mark set ${MARK} counter
+		ip daddr @${NFT_SET_ROUTE} meta mark set ${MARK} counter
+	}
+
+	# Локально сгенерированный трафик (роутер) не проходит prerouting —
+	# без output curl/nslookup с роутера никогда не попадут в туннель.
+	chain output {
+		type route hook output priority mangle; policy accept;
+		ip daddr @${NFT_SET_EXCL} return
+		ip daddr @${NFT_SET_ROUTE} meta mark set ${MARK} counter
+	}
+
+	chain mssfix {
+		type filter hook forward priority mangle; policy accept;
+		oifname "${IFACE}" tcp flags syn tcp option maxseg size set ${mss}
+		iifname "${IFACE}" tcp flags syn tcp option maxseg size set ${mss}
+	}
+}
+EOF
+}
+
+cleanup_legacy_nft() {
+	# Старые версии клали table в nftables.d — ломает fw4 reload
+	rm -f "$NFT_HOOK_LEGACY"
+}
+
+cleanup_legacy_ipset() {
+	iptables -t mangle -D PREROUTING -j WDTT 2>/dev/null
+	iptables -t mangle -F WDTT 2>/dev/null
+	iptables -t mangle -X WDTT 2>/dev/null
+	ipset destroy wdtt_route 2>/dev/null
+	ipset destroy wdtt_excl 2>/dev/null
+	ipset destroy wdtt_src 2>/dev/null
+}
+
+setup_nft() {
+	local err
+
+	if ! command -v nft >/dev/null 2>&1; then
+		log "ERROR: nft not found — apk add nftables kmod-nft-core"
+		echo "ERROR: apk add nftables kmod-nft-core" >&2
+		return 1
+	fi
+
+	modprobe nf_tables 2>/dev/null
+
+	cleanup_legacy_nft
+	cleanup_legacy_ipset
+	write_nft_hook
+	nft delete table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null
+
+	err="$(nft -f "$NFT_HOOK" 2>&1)" || {
+		log "ERROR nft -f: $err"
+		echo "ERROR nft -f: $err" >&2
+		return 1
+	}
+
+	if ! nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
+		log "ERROR: table inet wdtt not loaded after nft -f"
+		echo "ERROR: table inet wdtt not loaded" >&2
+		return 1
+	fi
+
+	log "nft table $NFT_TABLE loaded"
+	return 0
+}
+
+teardown_nft() {
+	rm -f "$NFT_HOOK"
+	rm -f "$NFT_HOOK_LEGACY"
+	nft delete table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null
+	cleanup_legacy_ipset
+}
+
+setup_policy_routing() {
+	local i ok=0
+
+	ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null
+	ip route flush table "$TABLE" 2>/dev/null
+	ip rule add fwmark "$MARK" table "$TABLE" priority 10050
+
+	# КРИТИЧНО: без default в table 100 маркированные пакеты никуда не идут
+	# (transfer ≈ keepalive). Повторяем — iface может ещё подниматься.
+	for i in 1 2 3 4 5; do
+		if ! ip link show "$IFACE" >/dev/null 2>&1; then
+			sleep 1
+			continue
+		fi
+		if ip route replace default dev "$IFACE" table "$TABLE" 2>/dev/null \
+			|| ip route add default dev "$IFACE" table "$TABLE" 2>/dev/null; then
+			ok=1
+			break
+		fi
+		sleep 1
+	done
+
+	if [ "$ok" -eq 1 ] && ip route show table "$TABLE" 2>/dev/null | grep -q .; then
+		log "OK: table $TABLE → default dev $IFACE"
+	else
+		log "ERROR: table $TABLE empty — traffic will NOT enter tunnel"
+		echo "ERROR: ip route replace default dev $IFACE table $TABLE failed" >&2
+		return 1
+	fi
+
+	# При policy-routing по fwmark ответный трафик приходит через туннель, а в
+	# main-таблице маршрут к серверу идёт через WAN → строгий rp_filter (=1)
+	# дропает пакеты → потери и падение скорости. Loose (=2) снимает проблему.
+	sysctl -qw net.ipv4.conf.all.rp_filter=2 2>/dev/null
+	sysctl -qw net.ipv4.conf.default.rp_filter=2 2>/dev/null
+	sysctl -qw "net.ipv4.conf.${IFACE}.rp_filter=2" 2>/dev/null
+	return 0
+}
+
+reload_dnsmasq() {
+	[ -f /etc/init.d/dnsmasq ] || return 0
+	# reload не всегда подхватывает confdir/nftset — restart надёжнее
+	/etc/init.d/dnsmasq restart 2>/dev/null || /etc/init.d/dnsmasq reload 2>/dev/null
+	sleep 2
+	pgrep -x dnsmasq >/dev/null 2>&1 || /etc/init.d/dnsmasq start 2>/dev/null
+}
+
+# Восстановить nft+policy после fw4 reload (без рестарта dnsmasq).
+do_restore() {
+	mkdir -p "$STATE_DIR"
+	[ -f "$STATE_DIR/routing.mode" ] || {
+		echo "selective" > "$STATE_DIR/routing.mode"
+	}
+	setup_nft || return 1
+	config_load wdtt 2>/dev/null || true
+	populate_nft_static 2>/dev/null || true
+	setup_policy_routing || ip route replace default dev "$IFACE" table "$TABLE" 2>/dev/null || true
+	# masq без fw4 reload
+	[ -x /etc/firewall.wdtt ] && /etc/firewall.wdtt 2>/dev/null || true
+	log "selective routing restored (nft+policy after fw4)"
+	seed_nft_route_ips 2>/dev/null || true
+	return 0
+}
+
+do_start() {
+	local rc=0
+
+	mkdir -p "$STATE_DIR" "$(dirname "$DNSMASQ_SNIPPET")"
+	# lock: hotplug не должен делать reload пока мы стартуем
+	: > "$STATE_DIR/firewall-refresh.lock"
+	log "starting selective routing (nft) on $IFACE v3.11.1"
+
+	[ -x /usr/libexec/wdtt/fix-config ] && /usr/libexec/wdtt/fix-config >/dev/null 2>&1 || true
+
+	ensure_dnsmasq_confdir
+	dns_ok=1
+	if ! check_dnsmasq_nftset; then
+		dns_ok=0
+		log "WARN: dnsmasq-full отсутствует — nft+policy всё равно поднимем; домены в set не попадут"
+		# Раньше return 1 здесь → table inet wdtt никогда не создавалась → 0 трафика
+	fi
+
+	if [ "$dns_ok" -eq 1 ]; then
+		build_dnsmasq || rc=1
+	else
+		# минимальный conf, чтобы confdir не был пустым
+		mkdir -p "$(dirname "$DNSMASQ_SNIPPET")"
+		: > "$DNSMASQ_SNIPPET"
+	fi
+
+	# Сначала nft table, потом firewall (без fw4 reload по возможности).
+	# Иначе fw4 reload стирает table inet wdtt → 0 трафика.
+	setup_nft || rc=1
+	if [ "$rc" -eq 0 ]; then
+		config_load wdtt
+		populate_nft_static
+		setup_policy_routing || rc=1
+
+		if [ -x /usr/libexec/wdtt/firewall-refresh ]; then
+			/usr/libexec/wdtt/firewall-refresh "$IFACE" >/dev/null 2>&1 || true
+			# если fw4 всё же перезагрузился — восстановить nft
+			if ! nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
+				log "WARN: nft table lost after firewall-refresh — restore"
+				do_restore || rc=1
+			fi
+		fi
+
+		# После firewall-refresh/hotplug table 100 иногда пустеет — добить маршрут
+		setup_policy_routing || {
+			log "WARN: re-setup policy routing after firewall"
+			ip route replace default dev "$IFACE" table "$TABLE" 2>/dev/null || true
+		}
+
+		if [ "$dns_ok" -eq 1 ]; then
+			reload_dnsmasq
+			# dnsmasq/network иногда сносят policy routes — ещё раз
+			ip route replace default dev "$IFACE" table "$TABLE" 2>/dev/null \
+				|| ip route add default dev "$IFACE" table "$TABLE" 2>/dev/null || true
+			warmup_nftset_domains
+		else
+			ip route replace default dev "$IFACE" table "$TABLE" 2>/dev/null \
+				|| ip route add default dev "$IFACE" table "$TABLE" 2>/dev/null || true
+		fi
+		echo "selective" > "$STATE_DIR/routing.mode"
+
+		# фоновый сторож: первые 2 минуты подстраховать table 100
+		(
+			i=0
+			while [ "$i" -lt 24 ]; do
+				sleep 5
+				[ -f "$STATE_DIR/routing.mode" ] || exit 0
+				ip link show "$IFACE" >/dev/null 2>&1 || continue
+				if ! ip route show table "$TABLE" 2>/dev/null | grep -q .; then
+					ip route replace default dev "$IFACE" table "$TABLE" 2>/dev/null
+					logger -t wdtt-routing "keepalive: restored table $TABLE"
+				fi
+				if ! nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
+					do_restore 2>/dev/null
+					logger -t wdtt-routing "keepalive: restored nft table"
+				fi
+				i=$((i + 1))
+			done
+		) &
+
+		if ip route show table "$TABLE" 2>/dev/null | grep -q .; then
+			log "selective routing active (table $TABLE ok)"
+		else
+			log "ERROR: selective active but table $TABLE still empty"
+			rc=1
+		fi
+	else
+		rm -f "$STATE_DIR/routing.mode"
+		log "selective routing FAILED (see errors above)"
+	fi
+
+	rm -f "$STATE_DIR/firewall-refresh.lock"
+	return "$rc"
+}
+
+do_stop() {
+	log "stopping selective routing"
+	teardown_nft
+	ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null
+	ip route flush table "$TABLE" 2>/dev/null
+	rm -f "$DNSMASQ_SNIPPET"
+	reload_dnsmasq
+	rm -f "$STATE_DIR/routing.mode"
+	log "selective routing stopped"
+}
+
+do_reload() {
+	do_stop
+	do_start
+}
+
+show_rule_status() {
+	local section="$1" type enabled
+	type="$(uci -q get wdtt.${section}.type)"
+	enabled="$(uci -q get wdtt.${section}.enabled)"
+	[ -z "$enabled" ] && enabled="(unset→on)"
+	echo "  rule ${section}: type=${type:-?} enabled=${enabled}"
+}
+
+do_status() {
+	local mode n
+	mode="$(uci -q get wdtt.globals.routing_mode)"
+	echo "routing_mode=${mode:-?}"
+	echo "routing_script=$(grep -m1 'WDTT_ROUTING_VERSION=' /usr/libexec/wdtt/routing 2>/dev/null || echo unknown)"
+	echo "state_file=$(cat "$STATE_DIR/routing.mode" 2>/dev/null || echo missing)"
+	echo "dnsmasq_confdir=$(uci -q get dhcp.@dnsmasq[0].confdir 2>/dev/null)"
+	echo "nft=$(command -v nft || echo missing)"
+	echo "--- uci rules ---"
+	config_load wdtt
+	config_foreach show_rule_status rule
+	echo "--- legacy option domain (must be empty) ---"
+	grep -E '^[[:space:]]*option domains?[[:space:]]' /etc/config/wdtt 2>/dev/null \
+		|| echo "(none — OK)"
+	echo "domain_list=$(uci -q get wdtt.route1.domain_list 2>/dev/null \
+		|| uci -q get wdtt.youtube.domain_list 2>/dev/null || echo -)"
+	echo "file domains=$(grep -E 'domain_list|list domain' /etc/config/wdtt 2>/dev/null | head -5)"
+	echo "--- /etc/config/wdtt (rules) ---"
+	grep -E "^config rule|domain|list_url" /etc/config/wdtt 2>/dev/null | head -20
+	echo "--- $DNSMASQ_SNIPPET ---"
+	if [ -f "$DNSMASQ_SNIPPET" ] && [ -s "$DNSMASQ_SNIPPET" ]; then
+		cat "$DNSMASQ_SNIPPET"
+		n=$(grep -c '^nftset=' "$DNSMASQ_SNIPPET" 2>/dev/null) || n=0
+		echo "($n nftset entries)"
+	else
+		echo "(empty)"
+	fi
+	echo "--- nft table ---"
+	nft list table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null | head -35 \
+		|| echo "(missing — run: routing reload wg-wdtt; check: logread | grep wdtt-routing)"
+	n=$(nft list set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET_ROUTE" 2>/dev/null | grep -cE '^\s+[0-9]+\.[0-9]+') || n=0
+	echo "wdtt_route IPs: ${n} (0 = warmup failed or no DNS yet)"
+	echo "--- ip route table $TABLE ---"
+	ip route show table "$TABLE" 2>/dev/null || echo "(empty — routing reload после connected)"
+	echo "--- firewall lan→wdtt ---"
+	uci -q get firewall.wdtt_lan_fwd.src 2>/dev/null && \
+		echo "forwarding: $(uci -q get firewall.wdtt_lan_fwd.src) → $(uci -q get firewall.wdtt_lan_fwd.dest)" \
+		|| echo "(missing — sh /etc/uci-defaults/99-wdtt)"
+}
+
+EXIT_RC=0
+
+case "$1" in
+	start)
+		routing_mode="$(uci -q get wdtt.globals.routing_mode)"
+		if [ "$routing_mode" = "full" ] || [ "$(uci -q get wdtt.globals.full_tunnel)" = "1" ]; then
+			# Раньше молчаливый exit 0 — казалось что start OK, а nft/table 100 пустые
+			msg="SKIP selective start: routing_mode=${routing_mode:-?} (full tunnel — nft/table100 не нужны)"
+			log "$msg"
+			echo "$msg" >&2
+			echo "  Для доменов: uci set wdtt.globals.routing_mode=selective; uci commit wdtt; $0 start $IFACE" >&2
+			exit 0
+		fi
+		do_start
+		EXIT_RC=$?
+		if [ "$EXIT_RC" -eq 0 ]; then
+			if ! nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
+				echo "ERROR: start rc=0 but nft table inet wdtt missing" >&2
+				log "ERROR: start rc=0 but nft table missing"
+				EXIT_RC=1
+			elif ! ip route show table "$TABLE" 2>/dev/null | grep -q .; then
+				echo "ERROR: start rc=0 but table $TABLE empty" >&2
+				log "ERROR: start rc=0 but table $TABLE empty"
+				EXIT_RC=1
+			else
+				echo "OK: selective routing (nft + table $TABLE)" >&2
+			fi
+		fi
+		;;
+	stop)
+		do_stop
+		;;
+	reload)
+		routing_mode="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+		if [ "$routing_mode" = "full" ] || [ "$(uci -q get wdtt.globals.full_tunnel 2>/dev/null)" = "1" ]; then
+			do_stop
+			echo "SKIP selective reload: mode=full" >&2
+			exit 0
+		fi
+		do_reload
+		EXIT_RC=$?
+		;;
+	restore)
+		# после fw4 reload: только nft+policy, без dnsmasq restart
+		routing_mode="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+		if [ "$routing_mode" = "full" ]; then
+			echo "SKIP restore: mode=full" >&2
+			exit 0
+		fi
+		do_restore
+		EXIT_RC=$?
+		;;
+	status)
+		do_status
+		;;
+	seed)
+		# Наполнить wdtt_route IP доменов (DoH-proof)
+		seed_nft_route_ips
+		EXIT_RC=$?
+		;;
+	*)
+		echo "Usage: $0 {start|stop|reload|restore|seed|status} [iface]" >&2
+		exit 1
+		;;
+esac
+
+exit "$EXIT_RC"

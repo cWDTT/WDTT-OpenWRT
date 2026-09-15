@@ -1,0 +1,65 @@
+
+config globals 'globals'
+	option enabled '0'
+	option peer ''
+	option password ''
+	option hashes ''
+	option hash1 ''
+	option hash2 ''
+	option hash3 ''
+	option hash4 ''
+	option workers '12'
+	option mtu '1240'
+	option listen '127.0.0.1:9000'
+	option turn_host ''
+	option turn_port ''
+	option captcha_mode 'wv'
+	option vk_auth_mode 'vkcalls'
+	# audio = OPUS PT 111 (совместимо со всеми серверами); video = PT 96 (нужен сервер с поддержкой)
+	option obfs_mode 'audio'
+	# DNS для VK API: doh-yandex|doh-cloudflare|doh-google|yandex|google|cloudflare|custom:IP|doh:URL
+	option go_dns 'doh-yandex'
+	# Транспорт до TURN-relay: udp (по умолчанию) | tcp — если провайдер душит UDP
+	option turn_transport 'udp'
+	option device_id ''
+	option iface 'wg-wdtt'
+	option tunnel_mode 'wg'
+	# selective = правила WDTT; full = весь трафик; external = только туннель (Podkop/PBR)
+	option routing_mode 'external'
+	option uplink_iface 'auto'
+	option active_profile ''
+
+# Сохранённые профили подключения (LuCI → Профили). Не трогает routing/device_id.
+# config profile 'home'
+#	option name 'Дом'
+#	option peer '203.0.113.10:56000'
+#	option password ''
+#	option hash1 ''
+#	option workers '9'
+#	option tunnel_mode 'wg'
+#	option turn_transport 'udp'
+
+# Пустое правило — домены в LuCI → «Домены» (option domain_list, не list domain)
+config rule 'route1'
+	option enabled '1'
+	option type 'route'
+	# option domain_list 'youtube.com,2ip.ru'
+
+# Пример: конкретное устройство — весь его трафик через WDTT
+# config rule 'phone'
+#	option enabled '0'
+#	option type 'route'
+#	list source_ip '192.168.1.100'
+
+# Пример: подсети напрямую (exclusion)
+# config rule 'lan_local'
+#	option enabled '0'
+#	option type 'exclusion'
+#	list subnet '192.168.0.0/16'
+#	list subnet '10.0.0.0/8'
+
+# Пример: список доменов по URL (один домен на строку)
+# config rule 'geoblock'
+#	option enabled '0'
+#	option type 'route'
+#	option list_url 'https://example.com/domains.txt'

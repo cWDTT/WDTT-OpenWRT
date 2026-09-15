@@ -1,0 +1,161 @@
+#!/bin/sh
+# После поднятия wg-wdtt (вне netifd): зона fw4, NAT, forward, ip_forward.
+# ВАЖНО: fw4 reload стирает table inet wdtt — поэтому:
+#  1) ставим lock, чтобы hotplug не делал routing reload во время нас;
+#  2) предпочитаем ad-hoc masquerade без полного fw4 reload.
+
+IFACE="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+IFACE="${IFACE:-wg-wdtt}"
+[ -n "$1" ] && [ "$1" != "apply" ] && [ "$1" != "--force-fw4" ] && IFACE="$1"
+if [ "$(uci -q get wdtt.globals.tunnel_mode 2>/dev/null)" = "raw" ] && [ "$IFACE" = "wg-wdtt" ]; then
+	IFACE="tun-wdtt"
+fi
+
+FORCE_FW4=0
+for a in "$@"; do
+	[ "$a" = "--force-fw4" ] && FORCE_FW4=1
+done
+
+LOCK="/var/run/wdtt/firewall-refresh.lock"
+STATE_DIR="/var/run/wdtt"
+
+log() { logger -t wdtt-firewall "$*"; }
+
+acquire_lock() {
+	mkdir -p "$STATE_DIR"
+	# hotplug смотрит на этот файл и пропускает routing reload
+	: > "$LOCK"
+	# на всякий случай — убрать через 30с если скрипт убит
+	( sleep 30; rm -f "$LOCK" ) &
+}
+
+release_lock() {
+	rm -f "$LOCK"
+}
+
+ensure_network_iface() {
+	if ! uci -q get network.wdtt >/dev/null 2>&1; then
+		uci -q batch <<-EOF
+			set network.wdtt=interface
+			set network.wdtt.proto='none'
+			set network.wdtt.device='$IFACE'
+			commit network
+		EOF
+		log "created network.wdtt device=$IFACE"
+	else
+		cur="$(uci -q get network.wdtt.device 2>/dev/null)"
+		if [ "$cur" != "$IFACE" ]; then
+			uci -q set network.wdtt.device="$IFACE"
+			uci -q commit network
+		fi
+	fi
+}
+
+ensure_firewall_zone() {
+	local changed=0
+	if ! uci -q get firewall.wdtt >/dev/null 2>&1; then
+		uci -q batch <<-EOF
+			set firewall.wdtt=zone
+			set firewall.wdtt.name='wdtt'
+			set firewall.wdtt.input='ACCEPT'
+			set firewall.wdtt.output='ACCEPT'
+			set firewall.wdtt.forward='ACCEPT'
+			set firewall.wdtt.masq='1'
+			set firewall.wdtt.mtu_fix='1'
+			add_list firewall.wdtt.network='wdtt'
+			commit firewall
+		EOF
+		changed=1
+		log "created firewall zone wdtt"
+	else
+		[ "$(uci -q get firewall.wdtt.masq)" = "1" ] || {
+			uci -q set firewall.wdtt.masq='1'
+			changed=1
+		}
+		[ "$(uci -q get firewall.wdtt.mtu_fix)" = "1" ] || {
+			uci -q set firewall.wdtt.mtu_fix='1'
+			changed=1
+		}
+		[ "$changed" -eq 1 ] && uci -q commit firewall
+	fi
+
+	if ! uci -q get firewall.wdtt_lan_fwd >/dev/null 2>&1; then
+		uci -q batch <<-EOF
+			set firewall.wdtt_lan_fwd=forwarding
+			set firewall.wdtt_lan_fwd.src='lan'
+			set firewall.wdtt_lan_fwd.dest='wdtt'
+			commit firewall
+		EOF
+		changed=1
+		log "created lan→wdtt forwarding"
+	fi
+	echo "$changed"
+}
+
+bring_up_iface() {
+	# Не делаем `network reload` — он часто триггерит fw4 и сносит nft wdtt.
+	ubus call network.interface.wdtt up 2>/dev/null || true
+	ifup wdtt 2>/dev/null || true
+}
+
+has_masq() {
+	nft list chain inet fw4 srcnat 2>/dev/null | grep -q "oifname \"$IFACE\""
+}
+
+add_masq_rule() {
+	[ -x /etc/firewall.wdtt ] && /etc/firewall.wdtt
+	# прямой fallback если firewall.wdtt не сработал
+	has_masq && return 0
+	nft add rule inet fw4 srcnat oifname "$IFACE" masquerade comment \"wdtt-nat\" 2>/dev/null
+	has_masq
+}
+
+apply_masq() {
+	local zone_changed="$1"
+
+	add_masq_rule && return 0
+
+	# Полный fw4 reload — только если зона только что создана или --force-fw4.
+	# Иначе стирается table inet wdtt и трафик в selective пропадает.
+	if [ "$FORCE_FW4" = "1" ] || [ "$zone_changed" = "1" ]; then
+		log "fw4 reload (zone_changed=$zone_changed force=$FORCE_FW4)"
+		if command -v fw4 >/dev/null 2>&1; then
+			fw4 reload 2>/dev/null || /etc/init.d/firewall reload 2>/dev/null
+		else
+			/etc/init.d/firewall reload 2>/dev/null
+		fi
+		sleep 1
+		add_masq_rule && return 0
+	fi
+	return 1
+}
+
+sysctl_tune() {
+	sysctl -qw net.ipv4.ip_forward=1 2>/dev/null
+	sysctl -qw net.ipv4.conf.all.forwarding=1 2>/dev/null
+	sysctl -qw net.ipv4.conf.default.forwarding=1 2>/dev/null
+	sysctl -qw net.ipv4.conf.all.rp_filter=2 2>/dev/null
+	sysctl -qw net.ipv4.conf.default.rp_filter=2 2>/dev/null
+	sysctl -qw "net.ipv4.conf.${IFACE}.rp_filter=2" 2>/dev/null
+}
+
+acquire_lock
+trap release_lock EXIT INT TERM
+
+if ! ip link show "$IFACE" >/dev/null 2>&1; then
+	log "WARN: $IFACE down — skip firewall refresh"
+	exit 1
+fi
+
+ensure_network_iface
+zone_changed="$(ensure_firewall_zone)"
+bring_up_iface
+sysctl_tune
+
+if apply_masq "$zone_changed"; then
+	log "OK: firewall ready for $IFACE (masq+forward)"
+	exit 0
+fi
+
+log "WARN: masquerade for $IFACE still missing — try: $0 $IFACE --force-fw4"
+exit 1

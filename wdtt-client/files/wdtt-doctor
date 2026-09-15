@@ -1,0 +1,311 @@
+#!/bin/sh
+# Полная диагностика WDTT (selective + full tunnel)
+
+IFACE="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+IFACE="${IFACE:-wg-wdtt}"
+ROUTING_MODE="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+ROUTING_MODE="${ROUTING_MODE:-external}"
+
+is_external_mode() {
+	case "$ROUTING_MODE" in
+	external|podkop|tunnel|tunnel_only) return 0 ;;
+	esac
+	return 1
+}
+
+echo "=== WDTT doctor ==="
+echo "routing_mode=${ROUTING_MODE}"
+
+if [ -x /usr/libexec/wdtt/fix-config ]; then
+	/usr/libexec/wdtt/fix-config || true
+else
+	echo "WARN: fix-config missing — sh install.sh"
+fi
+
+echo "--- routing script ---"
+rv="$(grep -m1 'WDTT_ROUTING_VERSION=' /usr/libexec/wdtt/routing 2>/dev/null | sed 's/.*WDTT_ROUTING_VERSION=//')"
+if [ -n "$rv" ] && grep -q 'parse_list_domain_line' /usr/libexec/wdtt/routing 2>/dev/null; then
+	echo "OK: routing script ($rv)"
+else
+	echo "FAIL: routing устарел/отсутствует — sh /tmp/wdtt-install.sh"
+fi
+
+echo "--- uci ---"
+if uci show wdtt 2>&1 | grep -qi 'parse error'; then
+	echo "FAIL: uci parse error (часто multiline hashes)"
+	uci show wdtt 2>&1 | head -3
+else
+	echo "OK: uci parse"
+	echo "hashes: $(uci -q get wdtt.globals.hashes 2>/dev/null | cut -c1-40)..."
+	echo "captcha_mode: $(uci -q get wdtt.globals.captcha_mode 2>/dev/null)"
+	echo "vk_auth_mode: $(uci -q get wdtt.globals.vk_auth_mode 2>/dev/null)"
+	echo "package_version: $(tr -d '\r\n' < /usr/share/wdtt/version 2>/dev/null || echo unknown)"
+	echo "uplink_iface: $(uci -q get wdtt.globals.uplink_iface 2>/dev/null || echo auto)"
+	# device_id должен быть непустым и одинаковым после перезагрузки, иначе
+	# сервер ответит DENIED:device_mismatch
+	echo "device_id: $(uci -q get wdtt.globals.device_id 2>/dev/null || echo EMPTY) (файл: $(tr -d '\r\n' < /etc/wdtt/device_id 2>/dev/null || echo none))"
+fi
+
+echo "--- uplink ---"
+if [ -x /usr/libexec/wdtt/uplink ]; then
+	/usr/libexec/wdtt/uplink status 2>/dev/null || echo "WARN: uplink status failed"
+else
+	echo "WARN: wdtt-uplink missing — sh install.sh"
+fi
+
+echo "--- dnsmasq ---"
+if [ "$ROUTING_MODE" = "full" ] || is_external_mode; then
+	echo "SKIP: dnsmasq nftset не нужен (режим ${ROUTING_MODE})"
+else
+	if command -v dnsmasq >/dev/null 2>&1 && dnsmasq --version 2>/dev/null | tr ' ,' '\n\n' | grep -qx 'nftset'; then
+		echo "OK: dnsmasq nftset"
+	else
+		echo "FAIL: нужен dnsmasq-full:"
+		echo "  apk del dnsmasq && apk add dnsmasq-full && /etc/init.d/dnsmasq restart"
+	fi
+	echo "confdir=$(uci -q get dhcp.@dnsmasq[0].confdir 2>/dev/null)"
+	if grep -rq wdtt /var/etc/dnsmasq* 2>/dev/null; then
+		echo "OK: wdtt.conf подключён в generated dnsmasq config"
+	else
+		echo "WARN: wdtt.conf не виден в /var/etc/dnsmasq* — /etc/init.d/dnsmasq restart"
+	fi
+fi
+
+echo "--- wireguard / datapath ---"
+if ip link show "$IFACE" >/dev/null 2>&1; then
+	echo "OK: $IFACE up"
+	ep="$(wg show "$IFACE" 2>/dev/null | awk '/endpoint:/ {print $2; exit}')"
+	hs="$(wg show "$IFACE" 2>/dev/null | awk -F': ' '/latest handshake/ {print $2; exit}')"
+	tr="$(wg show "$IFACE" 2>/dev/null | awk -F': ' '/transfer:/ {print $2; exit}')"
+	echo "endpoint: ${ep:-(none)}"
+	echo "handshake: ${hs:-(none)}"
+	echo "transfer: ${tr:-(none)}"
+	case "$ep" in
+	127.0.0.1:*|\[::1\]:*) echo "OK: endpoint localhost (wdttd)" ;;
+	"") echo "FAIL: нет endpoint — LuCI → Переподключить" ;;
+	*) echo "FAIL: endpoint=$ep (ожидается 127.0.0.1:9000) — сервер/конфиг WG" ;;
+	esac
+	if [ -z "$hs" ] || echo "$hs" | grep -qiE 'never|ago.*(hour|day)'; then
+		echo "FAIL: нет свежего handshake — TURN/uplink/воркеры (не routing_mode)"
+		echo "  uci get wdtt.globals.uplink_iface; /usr/libexec/wdtt/uplink status"
+	else
+		echo "OK: handshake свежий"
+	fi
+	if echo "$tr" | grep -qE '^[0-9]'; then
+		echo "OK: есть transfer"
+	else
+		echo "WARN: transfer пуст — трафик через туннель не идёт"
+	fi
+else
+	echo "FAIL: $IFACE down — сначала LuCI → Подключить"
+fi
+
+echo "--- nft selective table ---"
+if is_external_mode; then
+	echo "SKIP: selective nft — маршруты у Podkop (sing-box)"
+elif [ "$ROUTING_MODE" != "full" ]; then
+	if nft list table inet wdtt >/dev/null 2>&1; then
+		echo "OK: table inet wdtt"
+		n=$(nft list set inet wdtt wdtt_route 2>/dev/null | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+') || n=0
+		echo "wdtt_route IPs: $n"
+		if [ "$n" -eq 0 ]; then
+			echo "FAIL: набор пуст — трафик в туннель НЕ пойдёт"
+			echo "  cat /tmp/dnsmasq.d/wdtt.conf"
+			echo "  nslookup 2ip.ru 127.0.0.1; nft list set inet wdtt wdtt_route"
+			echo "  # ручной тест: nft add element inet wdtt wdtt_route { 188.40.167.82 }"
+		fi
+		if nft list chain inet wdtt output >/dev/null 2>&1; then
+			echo "OK: chain output (локальный трафик роутера)"
+		else
+			echo "WARN: нет chain output — обнови routing до v3.9.7+"
+		fi
+		nft list chain inet wdtt prerouting 2>/dev/null | grep -q counter \
+			&& echo "OK: mark counters в prerouting" || true
+	else
+		echo "FAIL: нет table inet wdtt — fw4 reload снёс selective; /usr/libexec/wdtt/routing restore $IFACE"
+	fi
+	ip rule show | grep -q 0x777474 && echo "OK: ip rule fwmark" || echo "FAIL: нет ip rule fwmark"
+	if ip route show table 100 2>/dev/null | grep -q .; then
+		echo "OK: table 100:"
+		ip route show table 100
+	else
+		echo "FAIL: table 100 ПУСТА — пакеты с mark некуда слать (типичный 0 трафика)"
+		echo "  FIX: ip route replace default dev $IFACE table 100"
+		ip route replace default dev "$IFACE" table 100 2>/dev/null \
+			&& echo "  → route добавлен" || echo "  → не удалось (wg-wdtt up?)"
+	fi
+	echo "wdtt.conf:"
+	if [ -s /tmp/dnsmasq.d/wdtt.conf ]; then
+		cat /tmp/dnsmasq.d/wdtt.conf
+	else
+		echo "FAIL: /tmp/dnsmasq.d/wdtt.conf пуст — нет доменов в правилах"
+	fi
+fi
+
+echo "--- firewall / NAT (оба режима) ---"
+if [ -x /usr/libexec/wdtt/firewall-refresh ] && ip link show "$IFACE" >/dev/null 2>&1; then
+	/usr/libexec/wdtt/firewall-refresh "$IFACE" >/dev/null 2>&1 || true
+	# после refresh снова проверить nft (не должен пропасть)
+	if [ "$ROUTING_MODE" != "full" ] && ! nft list table inet wdtt >/dev/null 2>&1; then
+		echo "WARN: nft table пропала после firewall-refresh — restore"
+		/usr/libexec/wdtt/routing restore "$IFACE" 2>/dev/null || true
+	fi
+fi
+if uci -q get firewall.wdtt >/dev/null 2>&1; then
+	echo "OK: firewall zone wdtt (masq=$(uci -q get firewall.wdtt.masq))"
+else
+	echo "FAIL: нет firewall.wdtt — sh /usr/libexec/wdtt/firewall-refresh"
+fi
+if uci -q get firewall.wdtt_lan_fwd.src >/dev/null 2>&1; then
+	echo "OK: lan→wdtt forwarding"
+else
+	echo "FAIL: нет lan→wdtt — клиенты LAN не попадут в туннель"
+fi
+if nft list chain inet fw4 srcnat 2>/dev/null | grep -q "oifname \"$IFACE\""; then
+	echo "OK: masquerade oifname $IFACE"
+else
+	echo "FAIL: нет masquerade на $IFACE — /usr/libexec/wdtt/firewall-refresh $IFACE"
+fi
+if sysctl -n net.ipv4.ip_forward 2>/dev/null | grep -q '^1$'; then
+	echo "OK: ip_forward=1"
+else
+	echo "FAIL: ip_forward=0"
+fi
+if pgrep -x wdttd >/dev/null 2>&1 && (netstat -ulnp 2>/dev/null || ss -ulnp 2>/dev/null) | grep -q '127.0.0.1:9000'; then
+	echo "OK: wdttd слушает 127.0.0.1:9000"
+else
+	echo "WARN: wdttd/9000 — проверьте /etc/init.d/wdtt restart"
+fi
+
+if [ "$ROUTING_MODE" = "full" ]; then
+	echo "--- full tunnel ---"
+	/usr/libexec/wdtt/routing stop 2>/dev/null || true
+	if ip link show "$IFACE" >/dev/null 2>&1; then
+		[ -x /usr/libexec/wdtt/full-tunnel ] && /usr/libexec/wdtt/full-tunnel apply 2>/dev/null || true
+	else
+		mkdir -p /var/run/wdtt
+		printf '%s\n' "full" > /var/run/wdtt/routing.mode
+	fi
+	if ip route show 0.0.0.0/1 2>/dev/null | grep -q "dev $IFACE"; then
+		echo "OK: route 0.0.0.0/1 dev $IFACE"
+	else
+		echo "FAIL: нет route 0.0.0.0/1 dev $IFACE"
+	fi
+	if ip route show 128.0.0.0/1 2>/dev/null | grep -q "dev $IFACE"; then
+		echo "OK: route 128.0.0.0/1 dev $IFACE"
+	else
+		echo "FAIL: нет route 128.0.0.0/1 dev $IFACE"
+	fi
+	if nft list chain inet fw4 srcnat 2>/dev/null | grep -q "oifname \"$IFACE\""; then
+		echo "OK: masquerade oifname $IFACE"
+	else
+		echo "WARN: нет masquerade на $IFACE — sh /etc/firewall.wdtt && fw4 reload"
+	fi
+	if sysctl -n net.ipv4.ip_forward 2>/dev/null | grep -q '^1$'; then
+		echo "OK: ip_forward=1"
+	else
+		echo "WARN: ip_forward=0 — sysctl -w net.ipv4.ip_forward=1"
+	fi
+elif is_external_mode; then
+	echo "--- external (Podkop) ---"
+	[ -x /usr/libexec/wdtt/datapath ] && /usr/libexec/wdtt/datapath ensure "$IFACE" 2>/dev/null || true
+else
+	echo "--- reload routing (selective) ---"
+	/usr/libexec/wdtt/routing reload "$IFACE" 2>&1 || true
+fi
+
+echo ""
+if is_external_mode; then
+	[ -x /usr/libexec/wdtt/podkop ] && /usr/libexec/wdtt/podkop status 2>/dev/null || echo "podkop status: script missing"
+elif ! [ "$ROUTING_MODE" = "full" ]; then
+	/usr/libexec/wdtt/routing status 2>/dev/null || echo "routing status failed"
+fi
+
+echo ""
+has_wdtt_domains() {
+	uci show wdtt 2>/dev/null | grep -qE '\.domain_list=' && return 0
+	grep -qE '^[[:space:]]*option domain_list[[:space:]]' /etc/config/wdtt 2>/dev/null && return 0
+	return 1
+}
+
+if [ "$ROUTING_MODE" = "full" ]; then
+	echo "=== full tunnel check ==="
+	state="$(tr -d '\r\n' < /var/run/wdtt/routing.mode 2>/dev/null || echo missing)"
+	if [ "$state" = "full" ]; then
+		echo "OK: state_file=full"
+	elif [ "$state" = "selective" ]; then
+		echo "FAIL: state_file=selective при routing_mode=full — doctor только что остановил selective"
+		echo "      LuCI Save & Apply → Переподключить"
+	else
+		echo "WARN: state_file=${state}"
+	fi
+elif is_external_mode; then
+	echo "=== podkop check ==="
+	state="$(tr -d '\r\n' < /var/run/wdtt/routing.mode 2>/dev/null || echo missing)"
+	if [ "$state" = "external" ]; then
+		echo "OK: state_file=external (WDTT туннель без маршрутов)"
+	else
+		echo "WARN: state_file=${state} — LuCI Save & Apply → Переподключить"
+	fi
+	echo "Правила WDTT не используются — списки доменов настраивайте в Podkop"
+else
+	echo "=== rule type check ==="
+	rules_ok=0
+	for section in $(uci -q show wdtt 2>/dev/null | sed -n "s/^wdtt\.\\([^.=]*\\)=rule\$/\\1/p"); do
+		rule_type="$(uci -q get "wdtt.${section}.type" 2>/dev/null)"
+		enabled="$(uci -q get "wdtt.${section}.enabled" 2>/dev/null)"
+		domains="$(uci -q get "wdtt.${section}.domain_list" 2>/dev/null)"
+		echo "rule ${section}: type=${rule_type:-route} enabled=${enabled:-1} domains=${domains:-(empty)}"
+		[ "$rule_type" = "exclusion" ] && echo "  FAIL: type=exclusion — домены идут напрямую"
+		[ "$enabled" = "0" ] && [ -n "$domains" ] && echo "  FAIL: enabled=0 — включите правило в LuCI"
+		[ -n "$domains" ] && [ "$enabled" != "0" ] && rules_ok=1
+	done
+	if ! has_wdtt_domains; then
+		echo "FAIL: нет domain_list — LuCI → Правила → Домены → «Принять изменения»"
+	elif [ "$rules_ok" -eq 0 ]; then
+		echo "FAIL: нет активного route-правила с доменами"
+	else
+		echo "OK: route-правила с доменами найдены"
+	fi
+
+	echo ""
+	echo "=== ghost check ==="
+	if grep -qE 'nftset=/(2iw\.|yoltlbe\.com|2iw\.rl)/' /tmp/dnsmasq.d/wdtt.conf 2>/dev/null; then
+		echo "FAIL: wdtt.conf содержит ghost-домены"
+	elif grep -q '^nftset=' /tmp/dnsmasq.d/wdtt.conf 2>/dev/null; then
+		if grep -qE 'nftset=/[^/]*\.com[a-z0-9][^/]*/' /tmp/dnsmasq.d/wdtt.conf 2>/dev/null; then
+			echo "FAIL: wdtt.conf — склеенные домены (.com без запятой). Запустите:"
+			echo "      /usr/libexec/wdtt/set-domains route1 youtube.com,googlevideo.com"
+		else
+			echo "OK: wdtt.conf домены выглядят нормально"
+		fi
+	else
+		echo "WARN: wdtt.conf пуст — «Принять изменения» в LuCI или routing reload"
+	fi
+
+	state="$(tr -d '\r\n' < /var/run/wdtt/routing.mode 2>/dev/null || echo missing)"
+	if [ "$state" = "selective" ]; then
+		echo "OK: routing active (state_file=selective)"
+	else
+		echo "FAIL: state_file=${state} (policy routing не применился)"
+	fi
+fi
+
+echo ""
+echo "=== Чеклист ==="
+if [ "$ROUTING_MODE" = "full" ]; then
+	echo "1) LuCI: Режим «Полный» → Save & Apply внизу страницы"
+	echo "2) Переподключить (Отключить → Подключить)"
+	echo "3) doctor: state_file=full, default route через wg-wdtt"
+	echo "4) curl -4 https://2ip.io с LAN-клиента"
+elif is_external_mode; then
+	echo "1) LuCI WDTT: Режим «Podkop» → Подключить"
+	echo "2) LuCI Podkop: section VPN → interface=$IFACE"
+	echo "3) /usr/libexec/wdtt/podkop status — OK"
+	echo "4) curl -4 https://2ip.io с LAN-клиента (DNS=роутер)"
+else
+	echo "1) LuCI: Правила → Домены, Включено → «Принять изменения»"
+	echo "2) Подключить → connected"
+	echo "3) doctor — wdtt_route IPs: 1+, state_file=selective"
+	echo "4) curl -4 https://2ip.io с LAN-клиента (DNS=роутер, DoH off)"
+fi

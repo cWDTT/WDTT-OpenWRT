@@ -1,0 +1,36 @@
+#!/bin/sh
+# Запись domain_list в UCI (без fix-config — он не нужен для чистой записи).
+#   wdtt-set-domains route1 youtube.com,googlevideo.com
+#   wdtt-set-domains route1 youtube.com googlevideo.com ytimg.com
+
+. /lib/functions.sh
+[ -f /usr/libexec/wdtt/domain-lib.sh ] && . /usr/libexec/wdtt/domain-lib.sh
+
+section="${1:?usage: wdtt-set-domains SECTION domain1,domain2,...}"
+shift
+
+raw="$(printf '%s' "$*" | tr ' \n\r\t;' ',,,,' | sed 's/,,*/,/g;s/^,//;s/,$//')"
+domains="$(normalize_domain_list_text "$raw")"
+[ -n "$domains" ] || {
+	echo "ERROR: no valid domains in: $*" >&2
+	exit 1
+}
+
+uci -q get "wdtt.${section}" >/dev/null 2>&1 || uci -q set "wdtt.${section}=rule"
+uci -q set "wdtt.${section}.type=route" 2>/dev/null
+uci -q set "wdtt.${section}.enabled=1" 2>/dev/null
+
+wdtt_uci_set_domain_list "$section" "$domains"
+
+iface="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+iface="${iface:-wg-wdtt}"
+mode="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+
+echo "domain_list=$(uci -q get wdtt.${section}.domain_list 2>/dev/null)"
+
+if [ "$mode" != "full" ] && [ -x /usr/libexec/wdtt/routing ]; then
+	/usr/libexec/wdtt/routing reload "$iface" 2>/dev/null || true
+	/etc/init.d/dnsmasq restart 2>/dev/null || true
+fi
+
+exit 0

@@ -1,0 +1,52 @@
+#!/bin/sh
+# Register WDTT firewall zone and dnsmasq snippet dir (OpenWrt 25.x / fw4)
+
+WDEV="wg-wdtt"
+
+uci -q batch <<-EOF >/dev/null
+	set firewall.wdtt=zone
+	set firewall.wdtt.name='wdtt'
+	set firewall.wdtt.input='ACCEPT'
+	set firewall.wdtt.output='ACCEPT'
+	set firewall.wdtt.forward='ACCEPT'
+	set firewall.wdtt.masq='1'
+	set firewall.wdtt.mtu_fix='1'
+	add_list firewall.wdtt.network='wdtt'
+	commit firewall
+EOF
+
+# Разрешить forward LAN → WDTT (без этого selective routing не работает для клиентов)
+if ! uci -q get firewall.wdtt_lan_fwd >/dev/null 2>&1; then
+	uci -q batch <<-EOF >/dev/null
+		set firewall.wdtt_lan_fwd=forwarding
+		set firewall.wdtt_lan_fwd.src='lan'
+		set firewall.wdtt_lan_fwd.dest='wdtt'
+		commit firewall
+EOF
+fi
+
+# Удалить legacy nftables.d hook (ломает fw4), затем reload
+rm -f /etc/nftables.d/99-wdtt.nft
+/etc/init.d/firewall reload 2>/dev/null || /etc/init.d/firewall restart 2>/dev/null
+
+if ! uci -q get network.wdtt >/dev/null; then
+	uci -q batch <<-EOF >/dev/null
+		set network.wdtt=interface
+		set network.wdtt.proto='none'
+		set network.wdtt.device='$WDEV'
+		commit network
+EOF
+fi
+
+# dnsmasq: подхватывает /tmp/dnsmasq.d/*.conf
+if uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1; then
+	if ! uci -q get dhcp.@dnsmasq[0].confdir 2>/dev/null | grep -qF '/tmp/dnsmasq.d'; then
+		uci -q add_list dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d' 2>/dev/null
+		uci commit dhcp 2>/dev/null
+	fi
+fi
+
+mkdir -p /tmp/dnsmasq.d /var/run/wdtt
+/etc/init.d/wdtt enable 2>/dev/null
+
+exit 0

@@ -1,0 +1,627 @@
+#!/bin/sh
+# rpcd ubus plugin for WDTT status
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+STATUS_FILE="/var/run/wdtt/status.json"
+LOG_FILE="/var/run/wdtt/wdtt.log"
+
+wdtt_write_stopped_status() {
+	mkdir -p /var/run/wdtt
+	cat > "$STATUS_FILE" <<'EOF'
+{"running":false,"state":"stopped","rx_bytes":0,"tx_bytes":0,"workers":0,"wg_applied":false,"uptime_sec":0}
+EOF
+}
+
+# На OpenWrt busybox pgrep -x часто врёт — проверяем несколькими способами
+wdtt_alive() {
+	local p
+	p="$(pidof wdttd 2>/dev/null)"
+	[ -n "$p" ] && return 0
+	pgrep -x wdttd >/dev/null 2>&1 && return 0
+	pgrep -f '/usr/sbin/wdttd' >/dev/null 2>&1 && return 0
+	pgrep wdttd >/dev/null 2>&1 && return 0
+	return 1
+}
+
+wdtt_iface_exists() {
+	local iface="$1"
+	[ -n "$iface" ] || return 1
+	ip link show "$iface" >/dev/null 2>&1
+}
+
+wdtt_connect() {
+	uci -q set wdtt.globals.enabled='1' || return 1
+	uci -q commit wdtt || return 1
+	/etc/init.d/wdtt restart 2>/dev/null || /etc/init.d/wdtt start 2>/dev/null
+	# Единый datapath: ждёт wg и поднимает selective ИЛИ full по UCI
+	(
+		if [ -x /usr/libexec/wdtt/datapath ]; then
+			/usr/libexec/wdtt/datapath wait-ensure
+			sleep 20
+			/usr/libexec/wdtt/datapath ensure
+		fi
+	) >/tmp/wdtt-datapath-connect.log 2>&1 &
+	return 0
+}
+
+wdtt_uci_parse_ok() {
+	uci show wdtt 2>&1 | grep -qi 'parse error' && return 1
+	return 0
+}
+
+wdtt_uci_line_value() {
+	local line="$1" val
+	val="${line#*\'}"
+	if [ "$val" != "$line" ]; then
+		val="${val%%\'*}"
+		printf '%s' "$val"
+		return 0
+	fi
+	val="${line#*\"}"
+	val="${val%%\"*}"
+	printf '%s' "$val"
+}
+
+wdtt_rule_section_name() {
+	local line="$1" section
+	section="${line#config rule }"
+	section="${section#\'}"; section="${section%%\'*}"
+	if [ "$section" = "${line#config rule }" ]; then
+		section="${section#\"}"; section="${section%%\"*}"
+	fi
+	section="${section%% *}"
+	printf '%s' "$section"
+}
+
+wdtt_rule_json_entry() {
+	local section="$1" type="$2" enabled="$3" domains="$4"
+	[ -n "$section" ] || return 0
+	json_add_object
+	json_add_string name "$section"
+	json_add_string type "${type:-route}"
+	json_add_string enabled "${enabled:-1}"
+	json_add_string domains "${domains:-}"
+	json_close_object
+}
+
+wdtt_rule_info_cb() {
+	local section="$1"
+	local type enabled domains
+
+	type="$(uci -q get "wdtt.${section}.type" 2>/dev/null)"
+	enabled="$(uci -q get "wdtt.${section}.enabled" 2>/dev/null)"
+	[ -z "$enabled" ] && enabled="1"
+	domains="$(uci -q get "wdtt.${section}.domain_list" 2>/dev/null)"
+	[ -z "$domains" ] && domains="$(wdtt_rule_domains_from_file "$section")"
+	wdtt_rule_json_entry "$section" "$type" "$enabled" "$domains"
+}
+
+wdtt_rule_domains_from_file() {
+	local want="$1" line section="" domains="" in_rule=0 val
+
+	[ -n "$want" ] || return 0
+	[ -r /etc/config/wdtt ] || return 0
+
+	while read -r line || [ -n "$line" ]; do
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+		case "$line" in
+			""|\#*) continue ;;
+			config\ rule\ *)
+				section="$(wdtt_rule_section_name "$line")"
+				if [ "$section" = "$want" ]; then
+					in_rule=1
+					domains=""
+				else
+					in_rule=0
+				fi
+				continue
+				;;
+			config\ *)
+				in_rule=0
+				continue
+				;;
+		esac
+		[ "$in_rule" -eq 1 ] || continue
+		case "$line" in
+			option\ domain_list\ *)
+				val="$(wdtt_uci_line_value "$line")"
+				[ -n "$domains" ] && [ -n "$val" ] && domains="$domains,$val"
+				[ -z "$domains" ] && domains="$val"
+				;;
+			list\ domain|list\ domain\ *|list\ domains|list\ domains\ *)
+				val="${line#list domain}"
+				val="${val#list domains}"
+				val="${val#"${val%%[![:space:]]*}"}"
+				val="${val#\'}"; val="${val%%\'*}"
+				if [ "$val" = "$line" ]; then
+					val="${val#\"}"; val="${val%%\"*}"
+				fi
+				[ -n "$val" ] || continue
+				[ -n "$domains" ] && domains="$domains,$val"
+				[ -z "$domains" ] && domains="$val"
+				;;
+		esac
+	done < /etc/config/wdtt
+	printf '%s' "$domains"
+}
+
+wdtt_rules_from_file() {
+	local line section="" type="route" enabled="1" domains="" in_rule=0 val
+
+	[ -r /etc/config/wdtt ] || return 0
+
+	while read -r line || [ -n "$line" ]; do
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+		case "$line" in
+			""|\#*) continue ;;
+			config\ rule\ *)
+				[ -n "$section" ] && wdtt_rule_json_entry "$section" "$type" "$enabled" "$domains"
+				section="$(wdtt_rule_section_name "$line")"
+				type="route"
+				enabled="1"
+				domains=""
+				in_rule=1
+				continue
+				;;
+			config\ *)
+				[ -n "$section" ] && wdtt_rule_json_entry "$section" "$type" "$enabled" "$domains"
+				section=""
+				domains=""
+				in_rule=0
+				continue
+				;;
+		esac
+		[ "$in_rule" -eq 1 ] || continue
+		case "$line" in
+			option\ type\ *)
+				type="$(wdtt_uci_line_value "$line")"
+				;;
+			option\ enabled\ *)
+				enabled="$(wdtt_uci_line_value "$line")"
+				;;
+			option\ domain_list\ *)
+				val="$(wdtt_uci_line_value "$line")"
+				[ -n "$domains" ] && [ -n "$val" ] && domains="$domains,$val"
+				[ -z "$domains" ] && domains="$val"
+				;;
+			list\ domain|list\ domain\ *|list\ domains|list\ domains\ *)
+				val="${line#list domain}"
+				val="${val#list domains}"
+				val="${val#"${val%%[![:space:]]*}"}"
+				val="${val#\'}"; val="${val%%\'*}"
+				if [ "$val" = "$line" ]; then
+					val="${val#\"}"; val="${val%%\"*}"
+				fi
+				[ -n "$val" ] || continue
+				[ -n "$domains" ] && domains="$domains,$val"
+				[ -z "$domains" ] && domains="$val"
+				;;
+		esac
+	done < /etc/config/wdtt
+	[ -n "$section" ] && wdtt_rule_json_entry "$section" "$type" "$enabled" "$domains"
+}
+
+wdtt_routing_info() {
+	local n iface uci_ok=1 mode state_file
+
+	iface="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+	iface="${iface:-wg-wdtt}"
+	mode="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+	wdtt_uci_parse_ok || uci_ok=0
+
+	state_file="$(tr -d '\r\n' < /var/run/wdtt/routing.mode 2>/dev/null || echo missing)"
+	case "$mode" in
+		full) state_file="full" ;;
+		external|podkop|tunnel|tunnel_only) state_file="external" ;;
+		*)
+			if [ "$state_file" = "full" ] || [ "$state_file" = "external" ]; then
+				state_file="stale-selective"
+			fi
+			;;
+	esac
+
+	json_init
+	json_add_string routing_mode "$mode"
+	json_add_string state_file "$state_file"
+	if [ -x /usr/libexec/wdtt/uplink ]; then
+		json_add_string uplink_iface "$(/usr/libexec/wdtt/uplink setting 2>/dev/null)"
+		json_add_string uplink_device "$(/usr/libexec/wdtt/uplink device 2>/dev/null)"
+		json_add_string uplink_gateway "$(/usr/libexec/wdtt/uplink gateway 2>/dev/null)"
+	else
+		json_add_string uplink_iface "$(uci -q get wdtt.globals.uplink_iface 2>/dev/null)"
+		json_add_string uplink_device ""
+		json_add_string uplink_gateway ""
+	fi
+	json_add_boolean uci_parse_ok "$uci_ok"
+	n=$(nft list set inet wdtt wdtt_route 2>/dev/null | grep -cE '^\s+[0-9]+\.[0-9]+') || n=0
+	json_add_int route_ips "$n"
+	json_add_array rules
+	if [ "$uci_ok" -eq 1 ]; then
+		config_load wdtt
+		config_foreach wdtt_rule_info_cb rule
+	elif [ -r /etc/config/wdtt ]; then
+		wdtt_rules_from_file
+	fi
+	json_close_array
+	json_dump
+}
+
+wdtt_merge_rules_json() {
+	local section enabled domain_list
+
+	json_get_type _t rules 2>/dev/null || return 0
+	[ "$_t" = "object" ] || return 0
+
+	json_select rules
+	json_get_keys sections
+	for section in $sections; do
+		json_select "$section"
+		json_get_var enabled enabled
+		json_get_var domain_list domain_list
+		json_select ..
+		[ -n "$section" ] || continue
+		uci -q get "wdtt.${section}" >/dev/null 2>&1 || uci -q set "wdtt.${section}=rule"
+		uci -q set "wdtt.${section}.type=route" 2>/dev/null
+		[ -n "$enabled" ] && uci -q set "wdtt.${section}.enabled=${enabled}"
+		if [ -n "$domain_list" ]; then
+			domain_list="$(printf '%s' "$domain_list" | tr ',;\n\r\t' ',,,,' | sed 's/,,*/,/g;s/^,//;s/,$//')"
+			while uci -q delete "wdtt.${section}.domain_list[0]" 2>/dev/null; do :; done
+			while uci -q delete "wdtt.${section}.domain[0]" 2>/dev/null; do :; done
+			uci -q batch <<-EOB
+				set wdtt.${section}.domain_list='${domain_list}'
+			EOB
+			logger -t wdtt "apply_rules: ${section} domain_list=${domain_list}"
+		fi
+	done
+	json_select ..
+	uci -q commit wdtt 2>/dev/null || return 1
+	return 0
+}
+
+wdtt_apply_rules() {
+	local iface mode
+	[ -x /usr/libexec/wdtt/fix-config ] && /usr/libexec/wdtt/fix-config 2>/dev/null || true
+	mode="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+	iface="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+	iface="${iface:-wg-wdtt}"
+	[ "$mode" = "full" ] && return 0
+	case "$mode" in external|podkop|tunnel|tunnel_only) return 0 ;; esac
+	if ip link show "$iface" >/dev/null 2>&1; then
+		if [ -x /usr/libexec/wdtt/datapath ]; then
+			/usr/libexec/wdtt/datapath ensure "$iface" 2>/dev/null || true
+		else
+			/usr/libexec/wdtt/routing reload "$iface" 2>/dev/null || true
+		fi
+	fi
+	return 0
+}
+
+wdtt_apply_config() {
+	local iface mode enabled old_mode old_uplink uplink restart=0
+	[ -x /usr/libexec/wdtt/fix-config ] && /usr/libexec/wdtt/fix-config 2>/dev/null || true
+	mode="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+	uplink="$(uci -q get wdtt.globals.uplink_iface 2>/dev/null)"
+	uplink="${uplink:-auto}"
+	iface="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+	iface="${iface:-wg-wdtt}"
+	enabled="$(uci -q get wdtt.globals.enabled 2>/dev/null)"
+	old_mode="$(tr -d '\r\n' < /var/run/wdtt/last_routing_mode 2>/dev/null)"
+	old_uplink="$(tr -d '\r\n' < /var/run/wdtt/last_uplink_iface 2>/dev/null)"
+	[ "$old_mode" != "$mode" ] && restart=1
+	[ "$old_uplink" != "$uplink" ] && restart=1
+
+	mkdir -p /var/run/wdtt
+	printf '%s\n' "$mode" > /var/run/wdtt/last_routing_mode
+	printf '%s\n' "$uplink" > /var/run/wdtt/last_uplink_iface
+
+	if ip link show "$iface" >/dev/null 2>&1; then
+		if [ -x /usr/libexec/wdtt/datapath ]; then
+			/usr/libexec/wdtt/datapath ensure "$iface" 2>/dev/null || true
+		elif [ "$mode" = "full" ]; then
+			/usr/libexec/wdtt/routing stop 2>/dev/null || true
+			[ -x /usr/libexec/wdtt/full-tunnel ] && /usr/libexec/wdtt/full-tunnel apply 2>/dev/null || true
+		else
+			/usr/libexec/wdtt/routing reload "$iface" 2>/dev/null || true
+		fi
+	fi
+
+	if [ "$restart" -eq 1 ] && [ "$enabled" = "1" ] && wdtt_alive; then
+		/etc/init.d/wdtt restart 2>/dev/null || true
+		(
+			sleep 8
+			[ -x /usr/libexec/wdtt/datapath ] && /usr/libexec/wdtt/datapath ensure
+		) >/dev/null 2>&1 &
+	fi
+	return 0
+}
+
+# Запись UCI-опции (значение одним аргументом uci — безопаснее batch с кавычками).
+wdtt_uci_set_opt() {
+	local key="$1" val="$2"
+	uci -q set "wdtt.globals.${key}=${val}"
+}
+
+# Запись профиля из уже разобранных полей (LuCI парсит URI в JS).
+wdtt_import_profile() {
+	local peer="$1" password="$2" hashes="$3" workers="$4" listen="$5"
+
+	peer="$(printf '%s' "$peer" | tr -d '\r\n')"
+	password="$(printf '%s' "$password" | tr -d '\r\n')"
+	hashes="$(printf '%s' "$hashes" | tr -d '\r\n' | tr ';|' ',')"
+	workers="$(printf '%s' "$workers" | tr -d '\r\n')"
+	listen="$(printf '%s' "$listen" | tr -d '\r\n')"
+
+	[ -n "$peer" ] || return 1
+	[ -n "$password" ] || return 1
+	[ -n "$hashes" ] || return 1
+
+	case "$workers" in
+		''|*[!0-9]*) workers=18 ;;
+	esac
+	[ "$workers" -ge 3 ] 2>/dev/null || workers=18
+	[ -n "$listen" ] || listen="127.0.0.1:9000"
+
+	wdtt_uci_set_opt peer "$peer" || return 1
+	wdtt_uci_set_opt password "$password" || return 1
+	wdtt_uci_set_opt hashes "$hashes" || return 1
+	# Раскладываем в отдельные слоты VK 1–4 (LuCI)
+	local i=1 part old_ifs
+	old_ifs="$IFS"
+	IFS=','
+	for part in $hashes; do
+		[ "$i" -le 4 ] || break
+		part="$(printf '%s' "$part" | tr -d '[:space:]')"
+		if [ -n "$part" ]; then
+			wdtt_uci_set_opt "hash$i" "$part" || return 1
+			i=$((i + 1))
+		fi
+	done
+	IFS="$old_ifs"
+	while [ "$i" -le 4 ]; do
+		wdtt_uci_set_opt "hash$i" "" || true
+		i=$((i + 1))
+	done
+	wdtt_uci_set_opt workers "$workers" || return 1
+	wdtt_uci_set_opt listen "$listen" || return 1
+	uci -q commit wdtt || return 1
+	return 0
+}
+
+wdtt_disconnect() {
+	uci -q set wdtt.globals.enabled='0' || return 1
+	uci -q commit wdtt || return 1
+
+	/etc/init.d/wdtt stop 2>/dev/null || true
+	killall wdttd 2>/dev/null || true
+	sleep 1
+	if wdtt_alive; then
+		killall -9 wdttd 2>/dev/null || true
+	fi
+
+	if [ -x /usr/libexec/wdtt/datapath ]; then
+		/usr/libexec/wdtt/datapath stop 2>/dev/null || true
+	else
+		[ -x /usr/libexec/wdtt/full-tunnel ] && /usr/libexec/wdtt/full-tunnel stop 2>/dev/null || true
+	fi
+	wdtt_write_stopped_status
+	return 0
+}
+
+case "$1" in
+	list)
+		echo '{ "status": {}, "logs": { "tail": 100 }, "captcha": { "token": "" }, "connect": {}, "disconnect": {}, "apply_config": {}, "apply_rules": { "rules": {} }, "routing_info": {}, "import_uri": { "peer": "", "password": "", "hashes": "", "workers": "", "listen": "" } }'
+		;;
+	call)
+		method="${2:-}"
+		case "$method" in
+			status)
+				pkg_ver="unknown"
+				[ -r /usr/share/wdtt/version ] && pkg_ver=$(tr -d '\r\n' < /usr/share/wdtt/version | head -c 32)
+				wdttd_ver=""
+				[ -x /usr/sbin/wdttd ] && wdttd_ver=$(/usr/sbin/wdttd -version 2>/dev/null | tr -d '\r\n' | head -c 32)
+				iface="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+				iface="${iface:-wg-wdtt}"
+				enabled="$(uci -q get wdtt.globals.enabled 2>/dev/null)"
+				enabled="${enabled:-0}"
+
+				alive=0
+				wg_up=0
+				wdtt_alive && alive=1
+				wdtt_iface_exists "$iface" && wg_up=1
+
+				# Источник правды — status.json от демона. На чтении файл НЕ затираем
+				# (иначе гонка с wdttd → вечный "stopped" при живом туннеле).
+				if [ -f "$STATUS_FILE" ]; then
+					json_load "$(cat "$STATUS_FILE")"
+				else
+					json_init
+					json_add_boolean running 0
+					json_add_string state "stopped"
+					json_add_int rx_bytes 0
+					json_add_int tx_bytes 0
+					json_add_int workers 0
+					json_add_boolean wg_applied 0
+				fi
+
+				json_get_var st_state state
+				json_get_var st_running running
+
+				if [ "$alive" = "1" ] || [ "$wg_up" = "1" ]; then
+					# Туннель/демон живы — подправляем ответ, если файл ещё пустой/stopped
+					case "$st_state" in
+						stopped|"")
+							json_add_string state "connected"
+							;;
+					esac
+					if [ "$st_running" != "1" ] && [ "$st_running" != "true" ]; then
+						json_add_boolean running 1
+					fi
+					if [ "$wg_up" = "1" ]; then
+						json_add_boolean wg_applied 1
+					fi
+				else
+					# Нет процесса и нет iface — показываем stopped (файл не трогаем здесь;
+					# затираем только при явном disconnect/stop)
+					case "$st_state" in
+						connected|connecting|starting|captcha_required)
+							json_add_boolean running 0
+							json_add_string state "stopped"
+							json_add_boolean wg_applied 0
+							json_add_int workers 0
+							;;
+					esac
+					if [ "$st_running" = "1" ] || [ "$st_running" = "true" ]; then
+						json_add_boolean running 0
+						json_add_string state "stopped"
+						json_add_boolean wg_applied 0
+					fi
+				fi
+
+				if [ "$wg_up" = "1" ]; then
+					json_add_boolean wg_iface_up 1
+				else
+					json_add_boolean wg_iface_up 0
+				fi
+
+				# Диагностика datapath (оба режима)
+				if [ "$enabled" = "1" ]; then
+					if [ -x /usr/libexec/wdtt/datapath ]; then
+						if /usr/libexec/wdtt/datapath status >/dev/null 2>&1; then
+							json_add_boolean datapath_ok 1
+						else
+							json_add_boolean datapath_ok 0
+						fi
+					fi
+					rmode="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+					rmode="${rmode:-selective}"
+					json_add_string routing_mode "$rmode"
+					if [ "$rmode" != "full" ]; then
+						if ip route show table 100 2>/dev/null | grep -q .; then
+							json_add_boolean table100_ok 1
+						else
+							json_add_boolean table100_ok 0
+						fi
+						if nft list table inet wdtt >/dev/null 2>&1; then
+							json_add_boolean nft_ok 1
+						else
+							json_add_boolean nft_ok 0
+						fi
+					fi
+				fi
+
+				json_add_string enabled "$enabled"
+				json_add_string package_version "$pkg_ver"
+				[ -n "$wdttd_ver" ] && json_add_string wdttd_version "$wdttd_ver"
+				json_dump
+				;;
+			logs)
+				json_load "$(cat)"
+				json_get_var tail tail
+				tail="${tail:-100}"
+				json_init
+				json_add_array lines
+				if [ -f "$LOG_FILE" ]; then
+					tmp="$(mktemp /tmp/wdtt-rpcd-log.XXXXXX)"
+					tail -n "$tail" "$LOG_FILE" > "$tmp"
+					while IFS= read -r line || [ -n "$line" ]; do
+						json_add_string "" "$line"
+					done < "$tmp"
+					rm -f "$tmp"
+				fi
+				json_close_array
+				json_dump
+				;;
+			captcha)
+				json_load "$(cat)"
+				json_get_var token token
+				if [ -n "$token" ]; then
+					/usr/sbin/wdttd -captcha "$token" 2>/dev/null
+					json_init
+					json_add_string result "ok"
+					json_dump
+				else
+					json_init
+					json_add_string error "empty token"
+					json_dump
+				fi
+				;;
+			connect)
+				if wdtt_connect; then
+					json_init
+					json_add_string result "ok"
+					json_add_string enabled "1"
+					json_dump
+				else
+					json_init
+					json_add_string error "connect failed"
+					json_dump
+				fi
+				;;
+			disconnect)
+				if wdtt_disconnect; then
+					json_init
+					json_add_string result "ok"
+					json_add_string enabled "0"
+					json_dump
+				else
+					json_init
+					json_add_string error "disconnect failed"
+					json_dump
+				fi
+				;;
+			apply_config)
+				if wdtt_apply_config; then
+					json_init
+					json_add_string result "ok"
+					json_dump
+				else
+					json_init
+					json_add_string error "apply_config failed"
+					json_dump
+				fi
+				;;
+			import_uri)
+				json_load "$(cat)"
+				json_get_var peer peer
+				json_get_var password password
+				json_get_var hashes hashes
+				json_get_var workers workers
+				json_get_var listen listen
+				if wdtt_import_profile "$peer" "$password" "$hashes" "$workers" "$listen"; then
+					json_init
+					json_add_string result "ok"
+					json_add_string peer "$(uci -q get wdtt.globals.peer 2>/dev/null)"
+					json_add_string hashes "$(uci -q get wdtt.globals.hashes 2>/dev/null)"
+					json_add_string workers "$(uci -q get wdtt.globals.workers 2>/dev/null)"
+					json_add_string listen "$(uci -q get wdtt.globals.listen 2>/dev/null)"
+					# пароль в ответ не отдаём
+					json_dump
+				else
+					json_init
+					json_add_string error "import failed: need peer, password and hashes"
+					json_dump
+				fi
+				;;
+			apply_rules)
+				json_load "$(cat)"
+				wdtt_merge_rules_json
+				if wdtt_apply_rules; then
+					json_init
+					json_add_string result "ok"
+					json_dump
+				else
+					json_init
+					json_add_string error "apply_rules failed"
+					json_dump
+				fi
+				;;
+			routing_info)
+				wdtt_routing_info
+				;;
+		esac
+		;;
+esac
