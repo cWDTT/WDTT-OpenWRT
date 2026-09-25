@@ -4,7 +4,7 @@ OpenWRT-клиент WDTT (WireGuard over VK TURN) с полным или выб
 
 ## Быстрая установка на роутер
 
-### Рабочие ссылки v3.19.0 (совместная работа с ssclash/OpenClash)
+### Рабочие ссылки v3.19.1 (совместная работа с ssclash / SSClash-Go)
 
 | Назначение | URL |
 |------------|-----|
@@ -57,7 +57,7 @@ sh /tmp/wdtt-install.sh
 
 Демон `wdttd` тянется с jsDelivr, так что доступ к GitHub Releases с роутера не обязателен.
 
-В конце должно быть `WDTT installer v3.19.0+` и проверки `[OK] routing (nft+nftset)`, `dnsmasq nftset`, `firewall lan→wdtt`.
+В конце должно быть `WDTT installer v3.19.1+` и проверки `[OK] routing (nft+nftset)`, `dnsmasq nftset`, `firewall lan→wdtt`.
 
 Установщик молча стоит 1–3 минуты на `firewall reload` после строки с `device_id` — это нормально, прерывать не нужно.
 
@@ -183,7 +183,7 @@ pgrep wdttd || echo "OK: wdttd not running"
 
 После `--clean`: `vk_auth_mode=vkcalls`, `captcha_mode=wv`, **домены пустые** — добавьте в LuCI → Правила маршрутизации. Проверьте peer/password/hashes → Подключить.
 
-Должно быть `WDTT installer v3.19.0+`, проверки `[OK] routing (nft+nftset)`, `dnsmasq nftset`, `firewall lan→wdtt`.
+Должно быть `WDTT installer v3.19.1+`, проверки `[OK] routing (nft+nftset)`, `dnsmasq nftset`, `firewall lan→wdtt`.
 
 После **Подключить** datapath (selective/full) поднимается сам: `/usr/libexec/wdtt/datapath ensure`. Ручной `routing start` не нужен.
 
@@ -482,7 +482,7 @@ uci commit wdtt
 
 Заворачивать один и тот же трафик обоими механизмами не нужно. Если хочется управлять списками из LuCI WDTT — переключайтесь на `selective` и выключайте WDTT-интерфейс в Podkop; держать оба режима одновременно смысла нет.
 
-## WDTT рядом с ssclash / OpenClash (v3.19.0)
+## WDTT рядом с ssclash / SSClash-Go / OpenClash (v3.19.0)
 
 Clash-стек можно держать на том же роутере — начиная с v3.19.0 они не мешают друг другу. До этой версии установка WDTT ломала уже настроенный ssclash, и выглядело это как «часть сайтов перестала открываться»: обе стороны использовали таблицу маршрутизации **100**, а WDTT при каждом `datapath ensure` делал `ip route flush table 100` и сносил оттуда строку `local default dev lo`, на которой держится TPROXY у Clash.
 
@@ -539,6 +539,22 @@ uci commit wdtt
 Чего делать не стоит: **полный туннель вместе с Clash** — WDTT заберёт весь трафик маршрутами `0.0.0.0/1` и `128.0.0.0/1`, и Clash останется без работы. Также не ставьте `route_table` в `100` или `101` — это таблицы Clash.
 
 Отдельно стоит помнить про контрольный канал: `wdttd` ходит к VK TURN в обход туннеля, через uplink. В ssclash по умолчанию WAN исключён из проксирования, так что это работает само; если вы настроили Clash перехватывать и WAN — добавьте uplink в исключения, иначе туннель не поднимется.
+
+### SSClash-Go (v3.19.1)
+
+[SSClash-Go](https://github.com/zerolabnet/SSClash-Go) — переписанная редакция ssclash: один демон со встроенным веб-интерфейсом вместо пакета LuCI. Сетевой слой у неё тот же самый, поэтому всё написанное выше применимо без изменений:
+
+| | ssclash (LuCI) | SSClash-Go |
+|---|----------------|------------|
+| Таблицы маршрутизации | 100 / 101 | 100 / 101 |
+| Префы `ip rule` | 1000 / 1001 | 1000 / 1001 |
+| Марки | `0x1` / `0x2` / `0x3` | `0x1` / `0x2` / `0x3` |
+| nft-таблица и хуки | `inet clash`, −150 / −100 | `inet clash`, −150 / −100 |
+| Пропуск чужих меток | `meta mark and … != 0 return` | так же |
+
+Различия, которые учитывает `clash status`: настройки лежат в `/opt/clash/.ssclash/settings` (JSON) вместо `/opt/clash/settings`, сервис называется `ssclash`, а не `clash`, веб-интерфейс на порту 9091.
+
+Одно поведение в Go-редакции новое: на OpenWrt она **по умолчанию уводит DNS в Mihomo** — прописывает dnsmasq upstream `127.0.0.1#7874` и `noresolv=1`. Выборочному режиму WDTT это не мешает, домены по-прежнему раскладывает сам dnsmasq через nftset. Но если в Mihomo включить `fake-ip`, в набор пойдут адреса `198.18.x.x` — та же оговорка, что и выше.
 
 ## OpenWrt 25.12 — пакетный менеджер APK
 

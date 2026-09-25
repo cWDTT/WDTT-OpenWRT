@@ -15,9 +15,9 @@
 # Не прерываем установку при ошибках apk (обрабатываем вручную)
 set +e
 
-WDTT_INSTALL_VERSION="3.19.0"
+WDTT_INSTALL_VERSION="3.19.1"
 WDTT_ROUTING_VERSION="3.19.0"
-WDTT_BIN_TAG="v3.19.0"
+WDTT_BIN_TAG="v3.19.1"
 
 GITHUB_REPO="cWDTT/WDTT-OpenWRT"
 GITHUB_BRANCH="main"
@@ -28,7 +28,7 @@ RAW_PIN="https://raw.githubusercontent.com/${GITHUB_REPO}/${REPO_REF}"
 JSDELIVR_URL="https://cdn.jsdelivr.net/gh/${GITHUB_REPO}@${GITHUB_BRANCH}"
 JSDELIVR_PIN="https://cdn.jsdelivr.net/gh/${GITHUB_REPO}@${REPO_REF}"
 RELEASE_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-RELEASE_BIN_URL="https://github.com/${GITHUB_REPO}/releases/download/v3.19.0/wdttd-linux-arm64"
+RELEASE_BIN_URL="https://github.com/${GITHUB_REPO}/releases/download/v3.19.1/wdttd-linux-arm64"
 DOWNLOAD_DIR="/tmp/wdtt-install"
 SECRETS_BACKUP="/tmp/wdtt-secrets-backup"
 COUNT=3
@@ -1118,9 +1118,9 @@ post_install() {
 		/usr/libexec/wdtt/doctor 2>/dev/null || true
 	fi
 
-	if [ -f /opt/clash/config.yaml ] || [ -f /etc/config/openclash ]; then
+	if [ -f /opt/clash/config.yaml ] || [ -x /opt/clash/bin/ssclash ] || [ -f /etc/config/openclash ]; then
 		msg ""
-		msg "Обнаружен Clash (ssclash/OpenClash) — проверка совместной работы:"
+		msg "Обнаружен Clash (SSClash-Go/ssclash/OpenClash) — проверка совместной работы:"
 		/usr/libexec/wdtt/clash status 2>/dev/null || true
 		msg "  Подробнее: /usr/libexec/wdtt/clash hint"
 	fi

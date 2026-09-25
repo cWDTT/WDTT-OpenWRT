@@ -296,9 +296,9 @@ else
 	fi
 fi
 
-if [ -f /opt/clash/config.yaml ] || [ -f /etc/config/openclash ]; then
+if [ -f /opt/clash/config.yaml ] || [ -x /opt/clash/bin/ssclash ] || [ -f /etc/config/openclash ]; then
 	echo ""
-	echo "=== Clash (ssclash/OpenClash) рядом с WDTT ==="
+	echo "=== Clash (SSClash-Go/ssclash/OpenClash) рядом с WDTT ==="
 	if [ -x /usr/libexec/wdtt/clash ]; then
 		/usr/libexec/wdtt/clash status 2>/dev/null || true
 	else

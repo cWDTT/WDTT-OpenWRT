@@ -11,7 +11,7 @@ CLEAN_ARG=""
 [ "$2" = "--clean" ] && CLEAN_ARG="--clean"
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="/tmp/wdtt-pc-install"
-VERSION="3.19.0"
+VERSION="3.19.1"
 REPO="https://github.com/cWDTT/WDTT-OpenWRT"
 PIN="f833bff"
 MIN_BIN_SIZE=1048576

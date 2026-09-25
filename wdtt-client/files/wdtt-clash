@@ -1,6 +1,6 @@
 #!/bin/sh
-# Проверка совместной работы WDTT и Clash-стека (ssclash / OpenClash).
-# WDTT_CLASH_VERSION=3.19.0
+# Проверка совместной работы WDTT и Clash-стека (ssclash / SSClash-Go / OpenClash).
+# WDTT_CLASH_VERSION=3.19.1
 #
 #   clash status  — что мешает работать вместе
 #   clash fix     — развести таблицы маршрутизации и перезапустить datapath
@@ -23,7 +23,9 @@ case "$TABLE" in
 esac
 
 CLASH_CONF=/opt/clash/config.yaml
+# ssclash на LuCI: KEY=VALUE в корне. SSClash-Go: JSON в .ssclash/.
 CLASH_SETTINGS=/opt/clash/settings
+CLASH_SETTINGS_GO=/opt/clash/.ssclash/settings
 
 is_external_mode() {
 	case "$MODE" in
@@ -32,9 +34,15 @@ is_external_mode() {
 	return 1
 }
 
-# Какой Clash стоит: ssclash (zerolabnet) или OpenClash.
+# Какой Clash стоит: SSClash-Go (демон ssclash), ssclash на LuCI или OpenClash.
+# Раскладка /opt/clash у обеих редакций ssclash одинаковая, различают их бинарь
+# демона и путь к настройкам.
 clash_flavor() {
-	if [ -f "$CLASH_CONF" ] || [ -x /opt/clash/bin/clash ] || [ -f /etc/init.d/clash ]; then
+	if [ -x /opt/clash/bin/ssclash ] || [ -f /etc/init.d/ssclash ] || [ -f "$CLASH_SETTINGS_GO" ]; then
+		echo ssclash-go
+		return 0
+	fi
+	if [ -f /etc/init.d/clash ] || [ -f "$CLASH_SETTINGS" ]; then
 		echo ssclash
 		return 0
 	fi
@@ -42,11 +50,29 @@ clash_flavor() {
 		echo openclash
 		return 0
 	fi
+	# Ядро есть, редакцию не опознали — проверки конфликтов всё равно валидны.
+	if [ -f "$CLASH_CONF" ] || [ -x /opt/clash/bin/clash ]; then
+		echo clash
+		return 0
+	fi
 	return 1
 }
 
 clash_running() {
 	pgrep -f '[c]lash' >/dev/null 2>&1 || pgrep -f '[m]ihomo' >/dev/null 2>&1
+}
+
+# proxyMode/mode из настроек: KEY=VALUE у LuCI-версии, JSON у SSClash-Go.
+clash_setting() {
+	local key_sh="$1" key_json="$2"
+	if [ -f "$CLASH_SETTINGS" ]; then
+		sed -n "s/^${key_sh}=//p" "$CLASH_SETTINGS" 2>/dev/null | head -1
+		return 0
+	fi
+	if [ -f "$CLASH_SETTINGS_GO" ]; then
+		sed -n "s/.*\"${key_json}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
+			"$CLASH_SETTINGS_GO" 2>/dev/null | head -1
+	fi
 }
 
 # Приоритет nft-цепочки: "type filter hook prerouting priority -160;" → -160
@@ -76,12 +102,14 @@ do_status() {
 
 	if [ -z "$flavor" ]; then
 		echo "WARN: Clash не найден (/opt/clash, /etc/config/openclash)"
-		echo "  ssclash: sh <(uclient-fetch -qO- https://raw.githubusercontent.com/zerolabnet/ssclash/main/install-ssclash.sh)"
+		echo "  SSClash-Go: wget -T 30 -qO- https://github.com/zerolabnet/SSClash-Go/raw/refs/heads/main/install-ssclash-go.sh | ash"
 		return 1
 	fi
 
 	if clash_running; then
 		echo "OK: clash/mihomo запущен"
+	elif [ "$flavor" = "ssclash-go" ]; then
+		echo "WARN: clash не запущен — /etc/init.d/ssclash restart (или Start в веб-UI :9091)"
 	else
 		echo "WARN: clash не запущен — /etc/init.d/clash restart"
 	fi
@@ -124,14 +152,17 @@ do_status() {
 			fi
 		fi
 		# Clash пропускает уже помеченные пакеты — на этом держится selective.
-		if [ "$flavor" = "ssclash" ]; then
-			if nft list chain inet clash CLASH_MARK 2>/dev/null | grep -q '0xff00'; then
-				echo "OK: Clash пропускает трафик, помеченный WDTT (mark and 0xff00)"
+		# Маска у разных редакций своя, важен сам факт правила.
+		case "$flavor" in
+		ssclash|ssclash-go|clash)
+			if nft list chain inet clash CLASH_MARK 2>/dev/null | grep -q 'meta mark and'; then
+				echo "OK: Clash пропускает трафик, помеченный WDTT"
 			else
-				echo "WARN: у Clash нет правила 'mark and 0xff00 != 0 return'"
+				echo "WARN: у Clash нет правила 'meta mark and … != 0 return'"
 				echo "  Обновите ssclash либо переключите WDTT в external"
 			fi
-		fi
+			;;
+		esac
 	elif is_external_mode || [ "$MODE" = "full" ]; then
 		echo "SKIP: nft-таблица WDTT не нужна (режим ${MODE:-?})"
 	else
@@ -153,11 +184,15 @@ do_status() {
 		echo "clash_dns=redir-host (реальные IP — выборочный режим WDTT работает)"
 	fi
 
-	# 5. Контрольный канал WDTT (VK TURN / peer) не должен уходить в прокси.
-	if [ -f "$CLASH_SETTINGS" ]; then
-		echo "clash_proxy_mode=$(sed -n 's/^PROXY_MODE=//p' "$CLASH_SETTINGS" 2>/dev/null | head -1)"
-		echo "clash_mode=$(sed -n 's/^MODE=//p' "$CLASH_SETTINGS" 2>/dev/null | head -1)"
+	# SSClash-Go на OpenWrt по умолчанию уводит dnsmasq в Mihomo (:7874).
+	# Для nftset это не помеха: dnsmasq по-прежнему резолвит сам.
+	if uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | grep -q '7874'; then
+		echo "clash_dns_capture=dnsmasq upstream → Mihomo :7874"
 	fi
+
+	# 5. Контрольный канал WDTT (VK TURN / peer) не должен уходить в прокси.
+	echo "clash_proxy_mode=$(clash_setting PROXY_MODE proxyMode)"
+	echo "clash_mode=$(clash_setting MODE mode)"
 	if [ -x /usr/libexec/wdtt/uplink ]; then
 		echo "wdtt_uplink=$(/usr/libexec/wdtt/uplink status 2>/dev/null | sed -n 's/^uplink_dev=//p' | head -1)"
 	fi
@@ -200,7 +235,7 @@ do_fix() {
 
 do_hint() {
 	cat <<EOF
-WDTT + Clash (ssclash / OpenClash), v3.19.0
+WDTT + Clash (SSClash-Go / ssclash / OpenClash), v3.19.1
 
 Две рабочие схемы:
 
