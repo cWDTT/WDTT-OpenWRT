@@ -8,16 +8,16 @@ OpenWRT-клиент WDTT (WireGuard over VK TURN) с полным или выб
 
 | Назначение | URL |
 |------------|-----|
-| **Установщик** | `https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@d6e3123/install.sh` |
-| routing (selective) | `https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1933519/wdtt-client/files/wdtt-routing` |
-| firewall-refresh | `https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1933519/wdtt-client/files/wdtt-firewall-refresh` |
+| **Установщик** | `https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@f833bff/install.sh` |
+| routing (selective) | `https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@ffa8937/wdtt-client/files/wdtt-routing` |
+| firewall-refresh | `https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@ffa8937/wdtt-client/files/wdtt-firewall-refresh` |
 | push-domain-fix (с ПК) | `sh scripts/push-domain-fix.sh root@IP` |
 
 Установка одной командой (pin):
 
 ```bash
 wget -O /tmp/wdtt-install.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@d6e3123/install.sh
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@f833bff/install.sh
 sh /tmp/wdtt-install.sh
 ```
 
@@ -49,7 +49,7 @@ sh /tmp/wdtt-install.sh
 
 ```bash
 wget -O /tmp/wdtt-install.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@d6e3123/install.sh
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@f833bff/install.sh
 sh /tmp/wdtt-install.sh
 ```
 
@@ -128,7 +128,7 @@ apk del wget-nossl
 
 ```bash
 wget -O /tmp/wdtt-install.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@d6e3123/install.sh
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@f833bff/install.sh
 sh /tmp/wdtt-install.sh
 ```
 
@@ -144,7 +144,7 @@ sh /tmp/wdtt-install.sh
 
 ```bash
 wget -O /tmp/wdtt-install.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@d6e3123/install.sh
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@f833bff/install.sh
 sh /tmp/wdtt-install.sh --clean
 ```
 
@@ -152,7 +152,7 @@ sh /tmp/wdtt-install.sh --clean
 
 ```bash
 wget -O /tmp/wdtt-install.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@d6e3123/install.sh
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@f833bff/install.sh
 sh /tmp/wdtt-install.sh --uninstall
 ```
 
@@ -213,7 +213,7 @@ ssh root@192.168.1.1 'WDTT_LOCAL_BIN=/tmp/wdttd sh /tmp/wdtt-install.sh'
 
 ```bash
 uclient-fetch -q -O /tmp/wdtt-install.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@d6e3123/install.sh
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@f833bff/install.sh
 sh /tmp/wdtt-install.sh
 ```
 
@@ -296,9 +296,9 @@ sh <(uclient-fetch --header="Authorization: Bearer $GITHUB_TOKEN" -q -O - \
 
 ```bash
 uclient-fetch -O /usr/libexec/wdtt/routing \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1933519/wdtt-client/files/wdtt-routing
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@ffa8937/wdtt-client/files/wdtt-routing
 uclient-fetch -O /usr/libexec/wdtt/firewall-refresh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1933519/wdtt-client/files/wdtt-firewall-refresh
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@ffa8937/wdtt-client/files/wdtt-firewall-refresh
 chmod 755 /usr/libexec/wdtt/routing /usr/libexec/wdtt/firewall-refresh
 /usr/libexec/wdtt/firewall-refresh wg-wdtt
 /usr/libexec/wdtt/routing reload wg-wdtt
