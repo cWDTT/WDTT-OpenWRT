@@ -4,7 +4,7 @@ OpenWRT-клиент WDTT (WireGuard over VK TURN) с полным или выб
 
 ## Быстрая установка на роутер
 
-### Рабочие ссылки v3.18.4 (список профилей + повтор запроса конфига)
+### Рабочие ссылки v3.19.0 (совместная работа с ssclash/OpenClash)
 
 | Назначение | URL |
 |------------|-----|
@@ -57,7 +57,7 @@ sh /tmp/wdtt-install.sh
 
 Демон `wdttd` тянется с jsDelivr, так что доступ к GitHub Releases с роутера не обязателен.
 
-В конце должно быть `WDTT installer v3.18.4+` и проверки `[OK] routing (nft+nftset)`, `dnsmasq nftset`, `firewall lan→wdtt`.
+В конце должно быть `WDTT installer v3.19.0+` и проверки `[OK] routing (nft+nftset)`, `dnsmasq nftset`, `firewall lan→wdtt`.
 
 Установщик молча стоит 1–3 минуты на `firewall reload` после строки с `device_id` — это нормально, прерывать не нужно.
 
@@ -183,7 +183,7 @@ pgrep wdttd || echo "OK: wdttd not running"
 
 После `--clean`: `vk_auth_mode=vkcalls`, `captcha_mode=wv`, **домены пустые** — добавьте в LuCI → Правила маршрутизации. Проверьте peer/password/hashes → Подключить.
 
-Должно быть `WDTT installer v3.18.4+`, проверки `[OK] routing (nft+nftset)`, `dnsmasq nftset`, `firewall lan→wdtt`.
+Должно быть `WDTT installer v3.19.0+`, проверки `[OK] routing (nft+nftset)`, `dnsmasq nftset`, `firewall lan→wdtt`.
 
 После **Подключить** datapath (selective/full) поднимается сам: `/usr/libexec/wdtt/datapath ensure`. Ручной `routing start` не нужен.
 
@@ -358,6 +358,8 @@ nft list set inet wdtt wdtt_route
 | `wdtt-client` | Go-демон `wdttd` + selective routing |
 | `luci-app-wdtt` | LuCI: туннель, правила, статус, логи |
 
+Вспомогательные скрипты живут в `/usr/libexec/wdtt/`: `datapath`, `routing`, `firewall-refresh`, `doctor`, `podkop` и `clash` (совместная работа с ssclash/OpenClash).
+
 ## Режимы работы
 
 У WDTT **две независимые настройки** режима, и их часто путают. `tunnel_mode` отвечает за то, **как** данные идут до VPS, а `routing_mode` — за то, **какой** трафик в этот туннель попадает. Менять их можно в любых сочетаниях.
@@ -375,9 +377,9 @@ RAW быстрее за счёт отсутствия двойного шифр�
 
 | `routing_mode` | Кто решает, что в туннель | Правила WDTT | Когда выбирать |
 |----------------|---------------------------|--------------|----------------|
-| **`external`** (по умолчанию после установки, он же «Podkop») | **Podkop** / sing-box | не используются | Уже стоит Podkop и списки настроены в нём |
-| **`selective`** | WDTT: домены, подсети, URL-списки | используются | Нужен обход без Podkop, своими списками |
-| **`full`** | весь трафик роутера | не используются | Нужно завернуть в туннель абсолютно всё |
+| **`external`** (по умолчанию после установки, он же «Podkop») | **Podkop** / sing-box, Clash | не используются | Уже стоит Podkop или Clash и списки настроены там |
+| **`selective`** | WDTT: домены, подсети, URL-списки | используются | Нужен обход без Podkop, своими списками; работает и рядом с ssclash |
+| **`full`** | весь трафик роутера | не используются | Нужно завернуть в туннель абсолютно всё; с Clash несовместим |
 
 Синонимы `external` в UCI: `podkop`, `tunnel`, `tunnel_only`. Если `routing_mode` вообще не задан, клиент падает в `selective`, но в поставляемом `/etc/config/wdtt` явно прописан `external`.
 
@@ -426,7 +428,7 @@ uci commit wdtt
 
 Режим **full** — весь трафик роутера через WDTT, секции `rule` не читаются.
 
-Режим **external** — туннель без маршрутов WDTT, выбор трафика отдаётся Podkop, см. следующий раздел.
+Режим **external** — туннель без маршрутов WDTT, выбор трафика отдаётся Podkop или Clash, см. следующие разделы.
 
 ## Режим Podkop — кто выбирает трафик
 
@@ -479,6 +481,64 @@ uci commit wdtt
 Когда handshake есть, а сайты из списков Podkop не открываются, типичных причин три: в Podkop указан не тот интерфейс (проверяется `podkop status`), включён `Route Allowed IPs`, или `routing_mode` остался `selective` и правила WDTT конфликтуют с sing-box.
 
 Заворачивать один и тот же трафик обоими механизмами не нужно. Если хочется управлять списками из LuCI WDTT — переключайтесь на `selective` и выключайте WDTT-интерфейс в Podkop; держать оба режима одновременно смысла нет.
+
+## WDTT рядом с ssclash / OpenClash (v3.19.0)
+
+Clash-стек можно держать на том же роутере — начиная с v3.19.0 они не мешают друг другу. До этой версии установка WDTT ломала уже настроенный ssclash, и выглядело это как «часть сайтов перестала открываться»: обе стороны использовали таблицу маршрутизации **100**, а WDTT при каждом `datapath ensure` делал `ip route flush table 100` и сносил оттуда строку `local default dev lo`, на которой держится TPROXY у Clash.
+
+Что изменилось:
+
+| Было (≤ v3.18.4) | Стало (v3.19.0) |
+|------------------|-----------------|
+| Таблица `100` — общая с Clash | Своя таблица `7477`, настраивается через `route_table` |
+| `ip route flush table 100` | Удаляется только собственный маршрут WDTT |
+| nft-хук `priority mangle` (−150), как у Clash | `priority -160` — WDTT метит пакеты первым |
+
+Порядок хуков важен: Clash пропускает уже помеченные пакеты по своему правилу `meta mark and 0xff00 != 0 return`, а метка WDTT (`0x777474`) под него подходит. Поэтому когда WDTT работает первым, разделение трафика получается предсказуемым, а не «как повезёт при загрузке».
+
+### Схема 1. Каждый тянет свой трафик
+
+Обычный случай: WDTT ведёт свои домены в туннель к VPS, Clash — свои через прокси.
+
+```bash
+uci set wdtt.globals.routing_mode='selective'
+uci commit wdtt
+```
+
+Домены WDTT — в LuCI → «Правила маршрутизации», списки Clash — в его конфиге. Пересекаться они не должны: один и тот же домен в обоих местах заберёт WDTT.
+
+Единственное ограничение — **DNS**. Если у Clash включён `enhanced-mode: fake-ip`, домены резолвятся в адреса `198.18.x.x`, и в nftset WDTT попадают фейковые IP вместо настоящих. Варианты: оставить `redir-host` (в ssclash так по умолчанию), добавить домены WDTT в `fake-ip-filter` у Clash или перейти на схему 2.
+
+### Схема 2. Clash выбирает, WDTT возит
+
+То же разделение обязанностей, что с Podkop: WDTT поднимает только интерфейс, весь выбор трафика за Clash.
+
+```bash
+uci set wdtt.globals.routing_mode='external'
+uci commit wdtt
+```
+
+В конфиге Clash выход направляется в туннель через `interface-name: wg-wdtt` (в RAW-режиме — `tun-wdtt`). Правила WDTT в этом режиме не читаются вообще.
+
+### Проверка
+
+```bash
+/usr/libexec/wdtt/clash status   # что мешает работать вместе
+/usr/libexec/wdtt/clash fix      # развести таблицы и перезапустить datapath
+/usr/libexec/wdtt/clash hint     # обе схемы одной страницей
+```
+
+| Строка | Что означает |
+|--------|--------------|
+| `OK: таблицы разведены` | WDTT и Clash не спорят за policy routing |
+| `FAIL: WDTT и Clash делят таблицу 100` | Выполните `clash fix` |
+| `FAIL: в таблице 100 остались маршруты WDTT` | Хвост от версии ≤ 3.18.4, лечится тем же `clash fix` |
+| `FAIL: WDTT не раньше Clash` | Старый `routing`-скрипт, нужен `routing reload wg-wdtt` |
+| `FAIL: fake-ip + выборочный режим` | См. оговорку про DNS в схеме 1 |
+
+Чего делать не стоит: **полный туннель вместе с Clash** — WDTT заберёт весь трафик маршрутами `0.0.0.0/1` и `128.0.0.0/1`, и Clash останется без работы. Также не ставьте `route_table` в `100` или `101` — это таблицы Clash.
+
+Отдельно стоит помнить про контрольный канал: `wdttd` ходит к VK TURN в обход туннеля, через uplink. В ssclash по умолчанию WAN исключён из проксирования, так что это работает само; если вы настроили Clash перехватывать и WAN — добавьте uplink в исключения, иначе туннель не поднимется.
 
 ## OpenWrt 25.12 — пакетный менеджер APK
 
@@ -544,6 +604,7 @@ uci set wdtt.globals.password='your-password'
 uci set wdtt.globals.hashes='abc123'
 uci set wdtt.globals.routing_mode='external'   # или selective / full
 uci set wdtt.globals.tunnel_mode='wg'          # raw — только если VPS с -listen-raw
+uci set wdtt.globals.route_table='7477'        # таблица policy routing (100/101 заняты Clash)
 uci set wdtt.globals.uplink_iface='auto'
 uci set wdtt.globals.workers='12'
 uci set wdtt.globals.obfs_mode='audio'   # или video — только если VPS принимает PT 96
@@ -583,7 +644,7 @@ wdttd
   └── /usr/libexec/wdtt/routing  (selective)
         ├── dnsmasq nftset → inet wdtt (домены)
         ├── nft prerouting fwmark 0x777474
-        └── ip rule → table 100 → wg-wdtt
+        └── ip rule → table 7477 → wg-wdtt
 ```
 
 ## Обфускация RTP (obfs_mode, v3.13.2+)

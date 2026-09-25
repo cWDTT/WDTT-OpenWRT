@@ -1,6 +1,6 @@
 #!/bin/sh
-# Единая точка datapath: selective | full | external (Podkop и др.).
-# WDTT_DATAPATH_VERSION=3.13.2
+# Единая точка datapath: selective | full | external (Podkop, Clash и др.).
+# WDTT_DATAPATH_VERSION=3.19.0
 #
 #   datapath ensure [iface]  — поднять/починить по UCI routing_mode
 #   datapath stop            — снять оба режима
@@ -16,7 +16,12 @@ fi
 
 STATE_DIR="/var/run/wdtt"
 MARK=0x777474
-TABLE=100
+# Таблицу 100 занимает ssclash/Clash (TPROXY) — держим свою.
+LEGACY_TABLE=100
+TABLE="$(uci -q get wdtt.globals.route_table 2>/dev/null)"
+case "$TABLE" in
+''|*[!0-9]*) TABLE=7477 ;;
+esac
 HEALTH="$STATE_DIR/datapath.ok"
 
 log() { logger -t wdtt-datapath "$*"; }
@@ -92,8 +97,16 @@ seed_selective_ips() {
 strip_wdtt_routes() {
 	[ -x /usr/libexec/wdtt/routing ] && /usr/libexec/wdtt/routing stop 2>/dev/null || true
 	[ -x /usr/libexec/wdtt/full-tunnel ] && /usr/libexec/wdtt/full-tunnel stop 2>/dev/null || true
-	ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null || true
-	ip route flush table "$TABLE" 2>/dev/null || true
+	while ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null; do :; done
+	# Таблицу 100 не флашим: там может быть "local default dev lo" от ssclash —
+	# без него у Clash отваливается TPROXY и часть хостов перестаёт открываться.
+	if [ "$TABLE" = "$LEGACY_TABLE" ]; then
+		ip route del default dev "$IFACE" table "$TABLE" 2>/dev/null || true
+	else
+		ip route flush table "$TABLE" 2>/dev/null || true
+		while ip rule del fwmark "$MARK" table "$LEGACY_TABLE" 2>/dev/null; do :; done
+		ip route del default dev "$IFACE" table "$LEGACY_TABLE" 2>/dev/null || true
+	fi
 	ip route del 0.0.0.0/1 dev "$IFACE" 2>/dev/null || true
 	ip route del 128.0.0.0/1 dev "$IFACE" 2>/dev/null || true
 	nft delete table inet wdtt 2>/dev/null || true
@@ -201,7 +214,7 @@ ensure_external() {
 		return 1
 	fi
 
-	msg "APPLY: external (tunnel only) on $IFACE — Podkop/PBR manages routes"
+	msg "APPLY: external (tunnel only) on $IFACE — Podkop/Clash/PBR manages routes"
 	strip_wdtt_routes
 	ensure_firewall
 
@@ -268,7 +281,8 @@ do_status() {
 	[ -f "$HEALTH" ] && cat "$HEALTH" || echo "health=missing"
 	echo "--- selective ---"
 	echo "nft=$(nft list table inet wdtt >/dev/null 2>&1 && echo ok || echo MISSING)"
-	echo "table100=$(ip route show table $TABLE 2>/dev/null | head -1)"
+	echo "route_table=$TABLE"
+	echo "table_route=$(ip route show table $TABLE 2>/dev/null | head -1)"
 	echo "rule=$(ip rule show 2>/dev/null | grep 777474 || echo MISSING)"
 	echo "wdtt_route_ips=$ips"
 	echo "--- full ---"
@@ -276,6 +290,7 @@ do_status() {
 	echo "route_128=$(ip route show 128.0.0.0/1 2>/dev/null | head -1)"
 	echo "--- external ---"
 	echo "hint=Podkop: connection_type=vpn, interface=$IFACE (или wdtt)"
+	echo "hint_clash=ssclash/OpenClash: /usr/libexec/wdtt/clash status"
 	case "$mode" in
 		full) full_ok && ok=1 ;;
 		external) external_ok && ok=1 ;;

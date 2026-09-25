@@ -1,13 +1,23 @@
 #!/bin/sh
 # WDTT selective routing — OpenWrt 25 / fw4
-# WDTT_ROUTING_VERSION=3.13.2
-# dnsmasq nftset → nft sets → fwmark → ip rule table 100 → wg-wdtt
+# WDTT_ROUTING_VERSION=3.19.0
+# dnsmasq nftset → nft sets → fwmark → ip rule → своя таблица → wg-wdtt
 
 . /lib/functions.sh
 [ -f /usr/libexec/wdtt/domain-lib.sh ] && . /usr/libexec/wdtt/domain-lib.sh
 
 MARK=0x777474
-TABLE=100
+RULE_PRIO=10050
+# Таблицу 100 занимает ssclash/Clash (TPROXY: "local default dev lo"), поэтому
+# своя. Переопределяется: uci set wdtt.globals.route_table=<номер>.
+LEGACY_TABLE=100
+TABLE="$(uci -q get wdtt.globals.route_table 2>/dev/null)"
+case "$TABLE" in
+''|*[!0-9]*) TABLE=7477 ;;
+esac
+# Хук раньше Clash (-150): помеченные нами пакеты Clash пропускает сам по
+# правилу "meta mark and 0xff00 != 0 return" — 0x777474 под него подходит.
+NFT_PRIO=-160
 IFACE="${2:-wg-wdtt}"
 
 NFT_TABLE=wdtt
@@ -626,7 +636,7 @@ table ${NFT_FAMILY} ${NFT_TABLE} {
 	}
 
 	chain prerouting {
-		type filter hook prerouting priority mangle; policy accept;
+		type filter hook prerouting priority ${NFT_PRIO}; policy accept;
 		ip saddr @${NFT_SET_EXCL} return
 		ip daddr @${NFT_SET_EXCL} return
 		ip saddr @${NFT_SET_SRC} meta mark set ${MARK} counter
@@ -636,7 +646,7 @@ table ${NFT_FAMILY} ${NFT_TABLE} {
 	# Локально сгенерированный трафик (роутер) не проходит prerouting —
 	# без output curl/nslookup с роутера никогда не попадут в туннель.
 	chain output {
-		type route hook output priority mangle; policy accept;
+		type route hook output priority ${NFT_PRIO}; policy accept;
 		ip daddr @${NFT_SET_EXCL} return
 		ip daddr @${NFT_SET_ROUTE} meta mark set ${MARK} counter
 	}
@@ -703,14 +713,34 @@ teardown_nft() {
 	cleanup_legacy_ipset
 }
 
+# Свою таблицу чистим целиком. Если она совпала с 100 (route_table=100), там
+# может жить ssclash/Clash — flush снёс бы его "local default dev lo" и убил
+# TPROXY, поэтому удаляем только собственный маршрут.
+flush_wdtt_table() {
+	if [ "$TABLE" = "$LEGACY_TABLE" ]; then
+		ip route del default dev "$IFACE" table "$TABLE" 2>/dev/null
+		return 0
+	fi
+	ip route flush table "$TABLE" 2>/dev/null
+}
+
+# Хвосты прежних версий WDTT в таблице 100 — только свои, Clash не трогаем.
+drop_legacy_table() {
+	[ "$TABLE" = "$LEGACY_TABLE" ] && return 0
+	while ip rule del fwmark "$MARK" table "$LEGACY_TABLE" 2>/dev/null; do :; done
+	ip route del default dev "$IFACE" table "$LEGACY_TABLE" 2>/dev/null
+	return 0
+}
+
 setup_policy_routing() {
 	local i ok=0
 
-	ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null
-	ip route flush table "$TABLE" 2>/dev/null
-	ip rule add fwmark "$MARK" table "$TABLE" priority 10050
+	while ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null; do :; done
+	flush_wdtt_table
+	drop_legacy_table
+	ip rule add fwmark "$MARK" table "$TABLE" priority "$RULE_PRIO"
 
-	# КРИТИЧНО: без default в table 100 маркированные пакеты никуда не идут
+	# КРИТИЧНО: без default в таблице маркированные пакеты никуда не идут
 	# (transfer ≈ keepalive). Повторяем — iface может ещё подниматься.
 	for i in 1 2 3 4 5; do
 		if ! ip link show "$IFACE" >/dev/null 2>&1; then
@@ -773,7 +803,7 @@ do_start() {
 	mkdir -p "$STATE_DIR" "$(dirname "$DNSMASQ_SNIPPET")"
 	# lock: hotplug не должен делать reload пока мы стартуем
 	: > "$STATE_DIR/firewall-refresh.lock"
-	log "starting selective routing (nft) on $IFACE v3.11.1"
+	log "starting selective routing (nft) on $IFACE (table $TABLE)"
 
 	[ -x /usr/libexec/wdtt/fix-config ] && /usr/libexec/wdtt/fix-config >/dev/null 2>&1 || true
 
@@ -810,7 +840,7 @@ do_start() {
 			fi
 		fi
 
-		# После firewall-refresh/hotplug table 100 иногда пустеет — добить маршрут
+		# После firewall-refresh/hotplug таблица иногда пустеет — добить маршрут
 		setup_policy_routing || {
 			log "WARN: re-setup policy routing after firewall"
 			ip route replace default dev "$IFACE" table "$TABLE" 2>/dev/null || true
@@ -828,7 +858,7 @@ do_start() {
 		fi
 		echo "selective" > "$STATE_DIR/routing.mode"
 
-		# фоновый сторож: первые 2 минуты подстраховать table 100
+		# фоновый сторож: первые 2 минуты подстраховать таблицу
 		(
 			i=0
 			while [ "$i" -lt 24 ]; do
@@ -865,8 +895,9 @@ do_start() {
 do_stop() {
 	log "stopping selective routing"
 	teardown_nft
-	ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null
-	ip route flush table "$TABLE" 2>/dev/null
+	while ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null; do :; done
+	flush_wdtt_table
+	drop_legacy_table
 	rm -f "$DNSMASQ_SNIPPET"
 	reload_dnsmasq
 	rm -f "$STATE_DIR/routing.mode"
@@ -932,8 +963,8 @@ case "$1" in
 	start)
 		routing_mode="$(uci -q get wdtt.globals.routing_mode)"
 		if [ "$routing_mode" = "full" ] || [ "$(uci -q get wdtt.globals.full_tunnel)" = "1" ]; then
-			# Раньше молчаливый exit 0 — казалось что start OK, а nft/table 100 пустые
-			msg="SKIP selective start: routing_mode=${routing_mode:-?} (full tunnel — nft/table100 не нужны)"
+			# Раньше молчаливый exit 0 — казалось что start OK, а nft/таблица пустые
+			msg="SKIP selective start: routing_mode=${routing_mode:-?} (full tunnel — nft/policy routing не нужны)"
 			log "$msg"
 			echo "$msg" >&2
 			echo "  Для доменов: uci set wdtt.globals.routing_mode=selective; uci commit wdtt; $0 start $IFACE" >&2

@@ -500,7 +500,11 @@ case "$1" in
 					rmode="${rmode:-selective}"
 					json_add_string routing_mode "$rmode"
 					if [ "$rmode" != "full" ]; then
-						if ip route show table 100 2>/dev/null | grep -q .; then
+						# Таблица 100 отдана ssclash/Clash — WDTT живёт в своей.
+						rtable="$(uci -q get wdtt.globals.route_table 2>/dev/null)"
+						case "$rtable" in ''|*[!0-9]*) rtable=7477 ;; esac
+						json_add_int route_table "$rtable"
+						if ip route show table "$rtable" 2>/dev/null | grep -q .; then
 							json_add_boolean table100_ok 1
 						else
 							json_add_boolean table100_ok 0

@@ -15,9 +15,9 @@
 # Не прерываем установку при ошибках apk (обрабатываем вручную)
 set +e
 
-WDTT_INSTALL_VERSION="3.18.4"
-WDTT_ROUTING_VERSION="3.13.2"
-WDTT_BIN_TAG="v3.18.4"
+WDTT_INSTALL_VERSION="3.19.0"
+WDTT_ROUTING_VERSION="3.19.0"
+WDTT_BIN_TAG="v3.19.0"
 
 GITHUB_REPO="cWDTT/WDTT-OpenWRT"
 GITHUB_BRANCH="main"
@@ -28,7 +28,7 @@ RAW_PIN="https://raw.githubusercontent.com/${GITHUB_REPO}/${REPO_REF}"
 JSDELIVR_URL="https://cdn.jsdelivr.net/gh/${GITHUB_REPO}@${GITHUB_BRANCH}"
 JSDELIVR_PIN="https://cdn.jsdelivr.net/gh/${GITHUB_REPO}@${REPO_REF}"
 RELEASE_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-RELEASE_BIN_URL="https://github.com/${GITHUB_REPO}/releases/download/v3.18.4/wdttd-linux-arm64"
+RELEASE_BIN_URL="https://github.com/${GITHUB_REPO}/releases/download/v3.19.0/wdttd-linux-arm64"
 DOWNLOAD_DIR="/tmp/wdtt-install"
 SECRETS_BACKUP="/tmp/wdtt-secrets-backup"
 COUNT=3
@@ -487,7 +487,8 @@ install_wdtt_helpers() {
 		"firewall-refresh:wdtt-client/files/wdtt-firewall-refresh" \
 		"keepalive:wdtt-client/files/wdtt-keepalive" \
 		"datapath:wdtt-client/files/wdtt-datapath" \
-		"podkop:wdtt-client/files/wdtt-podkop"
+		"podkop:wdtt-client/files/wdtt-podkop" \
+		"clash:wdtt-client/files/wdtt-clash"
 	do
 		dest="/usr/libexec/wdtt/${f%%:*}"
 		src="${f#*:}"
@@ -502,7 +503,7 @@ install_wdtt_helpers() {
 	[ -x /usr/libexec/wdtt/fix-config ] || install_wdtt_fix_config_inline
 	[ -x /usr/libexec/wdtt/doctor ] || install_wdtt_doctor_inline
 
-	# cron: раз в минуту чинит table 100 / nft если слетели
+	# cron: раз в минуту чинит policy routing / nft если слетели
 	if [ -x /usr/libexec/wdtt/keepalive ]; then
 		if [ -d /etc/crontabs ] || mkdir -p /etc/crontabs 2>/dev/null; then
 			touch /etc/crontabs/root
@@ -830,8 +831,16 @@ uninstall_wdtt() {
 		msg "  removed /etc/config/wdtt (fresh config on install)"
 	fi
 
-	ip rule del fwmark 0x777474 table 100 2>/dev/null
-	ip route flush table 100 2>/dev/null
+	wdtt_iface="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+	wdtt_iface="${wdtt_iface:-wg-wdtt}"
+	wdtt_table="$(uci -q get wdtt.globals.route_table 2>/dev/null)"
+	case "$wdtt_table" in ''|*[!0-9]*) wdtt_table=7477 ;; esac
+	while ip rule del fwmark 0x777474 table "$wdtt_table" 2>/dev/null; do :; done
+	while ip rule del fwmark 0x777474 table 100 2>/dev/null; do :; done
+	[ "$wdtt_table" = "100" ] || ip route flush table "$wdtt_table" 2>/dev/null
+	# В таблице 100 может жить ssclash/Clash — сносим только свой маршрут.
+	ip route del default dev "$wdtt_iface" table 100 2>/dev/null
+	ip route del default dev tun-wdtt table 100 2>/dev/null
 	nft delete table inet wdtt 2>/dev/null
 
 	/etc/init.d/dnsmasq reload 2>/dev/null || /etc/init.d/dnsmasq restart 2>/dev/null
@@ -848,6 +857,15 @@ fix_wdtt_legacy() {
 		rm -f /etc/nftables.d/99-wdtt.nft
 		/etc/init.d/firewall reload 2>/dev/null || true
 	fi
+	# До v3.19 WDTT жил в таблице 100 — её же занимает ssclash/Clash под TPROXY.
+	# Свои остатки убираем точечно, чужие маршруты не трогаем.
+	local legacy_iface
+	for legacy_iface in wg-wdtt tun-wdtt; do
+		ip route del default dev "$legacy_iface" table 100 2>/dev/null \
+			&& warn "Убран legacy-маршрут WDTT из таблицы 100 ($legacy_iface)"
+	done
+	while ip rule del fwmark 0x777474 table 100 2>/dev/null; do :; done
+
 	/usr/libexec/wdtt/routing stop 2>/dev/null || true
 	ensure_routing_script 2>/dev/null || true
 	[ -x /usr/libexec/wdtt/fix-config ] && /usr/libexec/wdtt/fix-config 2>/dev/null || true
@@ -1098,6 +1116,13 @@ post_install() {
 		msg ""
 		msg "Запуск wdtt-doctor..."
 		/usr/libexec/wdtt/doctor 2>/dev/null || true
+	fi
+
+	if [ -f /opt/clash/config.yaml ] || [ -f /etc/config/openclash ]; then
+		msg ""
+		msg "Обнаружен Clash (ssclash/OpenClash) — проверка совместной работы:"
+		/usr/libexec/wdtt/clash status 2>/dev/null || true
+		msg "  Подробнее: /usr/libexec/wdtt/clash hint"
 	fi
 
 	msg ""

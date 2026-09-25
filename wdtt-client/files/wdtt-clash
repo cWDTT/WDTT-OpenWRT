@@ -1,0 +1,233 @@
+#!/bin/sh
+# Проверка совместной работы WDTT и Clash-стека (ssclash / OpenClash).
+# WDTT_CLASH_VERSION=3.19.0
+#
+#   clash status  — что мешает работать вместе
+#   clash fix     — развести таблицы маршрутизации и перезапустить datapath
+#   clash hint    — как настраивать связку
+
+IFACE="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+IFACE="${IFACE:-wg-wdtt}"
+if [ "$(uci -q get wdtt.globals.tunnel_mode 2>/dev/null)" = "raw" ] && [ "$IFACE" = "wg-wdtt" ]; then
+	IFACE="tun-wdtt"
+fi
+MODE="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+
+MARK=0x777474
+# Clash держит TPROXY в 100 (и 101 под UDP в MIXED) — пересекаться нельзя.
+CLASH_TABLES="100 101"
+DEFAULT_TABLE=7477
+TABLE="$(uci -q get wdtt.globals.route_table 2>/dev/null)"
+case "$TABLE" in
+''|*[!0-9]*) TABLE="$DEFAULT_TABLE" ;;
+esac
+
+CLASH_CONF=/opt/clash/config.yaml
+CLASH_SETTINGS=/opt/clash/settings
+
+is_external_mode() {
+	case "$MODE" in
+	external|podkop|tunnel|tunnel_only) return 0 ;;
+	esac
+	return 1
+}
+
+# Какой Clash стоит: ssclash (zerolabnet) или OpenClash.
+clash_flavor() {
+	if [ -f "$CLASH_CONF" ] || [ -x /opt/clash/bin/clash ] || [ -f /etc/init.d/clash ]; then
+		echo ssclash
+		return 0
+	fi
+	if [ -f /etc/config/openclash ]; then
+		echo openclash
+		return 0
+	fi
+	return 1
+}
+
+clash_running() {
+	pgrep -f '[c]lash' >/dev/null 2>&1 || pgrep -f '[m]ihomo' >/dev/null 2>&1
+}
+
+# Приоритет nft-цепочки: "type filter hook prerouting priority -160;" → -160
+chain_priority() {
+	nft list chain inet "$1" "$2" 2>/dev/null \
+		| sed -n 's/.*hook [a-z]* priority \(-\{0,1\}[0-9]*\).*/\1/p' | head -1
+}
+
+# Таблица, которую Clash реально занял (есть маршруты, но не наши).
+table_taken_by_clash() {
+	local t="$1" out
+	out="$(ip route show table "$t" 2>/dev/null)" || return 1
+	[ -n "$out" ] || return 1
+	printf '%s\n' "$out" | grep -qv "dev $IFACE"
+}
+
+do_status() {
+	local ok=1 flavor prio_wdtt prio_clash t leftovers
+
+	flavor="$(clash_flavor)" || flavor=""
+
+	echo "wdtt_routing_mode=${MODE:-?}"
+	echo "wdtt_iface=$IFACE"
+	echo "wdtt_route_table=$TABLE"
+	echo "wdtt_mark=$MARK"
+	echo "clash_stack=${flavor:-none}"
+
+	if [ -z "$flavor" ]; then
+		echo "WARN: Clash не найден (/opt/clash, /etc/config/openclash)"
+		echo "  ssclash: sh <(uclient-fetch -qO- https://raw.githubusercontent.com/zerolabnet/ssclash/main/install-ssclash.sh)"
+		return 1
+	fi
+
+	if clash_running; then
+		echo "OK: clash/mihomo запущен"
+	else
+		echo "WARN: clash не запущен — /etc/init.d/clash restart"
+	fi
+
+	# 1. Главное: таблицы маршрутизации не должны пересекаться.
+	for t in $CLASH_TABLES; do
+		if [ "$TABLE" = "$t" ]; then
+			echo "FAIL: WDTT и Clash делят таблицу $t — Clash будет терять TPROXY"
+			echo "  FIX: /usr/libexec/wdtt/clash fix"
+			ok=0
+		fi
+	done
+	[ "$ok" -eq 1 ] && echo "OK: таблицы разведены (WDTT $TABLE, Clash $CLASH_TABLES)"
+
+	# 2. Хвосты старых версий WDTT в таблице Clash.
+	leftovers="$(ip route show table 100 2>/dev/null | grep -c "dev $IFACE")" || leftovers=0
+	if [ "${leftovers:-0}" -gt 0 ] && [ "$TABLE" != "100" ]; then
+		echo "FAIL: в таблице 100 остались маршруты WDTT ($IFACE) от старой версии"
+		echo "  FIX: ip route del default dev $IFACE table 100"
+		ok=0
+	fi
+	if ip rule show 2>/dev/null | grep -q "fwmark $MARK lookup 100"; then
+		echo "FAIL: ip rule WDTT всё ещё смотрит в таблицу 100"
+		echo "  FIX: /usr/libexec/wdtt/clash fix"
+		ok=0
+	fi
+
+	# 3. Порядок nft-хуков: WDTT должен метить раньше Clash.
+	if nft list table inet wdtt >/dev/null 2>&1; then
+		prio_wdtt="$(chain_priority wdtt prerouting)"
+		prio_clash="$(chain_priority clash mangle)"
+		echo "nft_priority: wdtt=${prio_wdtt:-?} clash=${prio_clash:-?}"
+		if [ -n "$prio_wdtt" ] && [ -n "$prio_clash" ]; then
+			if [ "$prio_wdtt" -lt "$prio_clash" ]; then
+				echo "OK: WDTT метит пакеты раньше Clash"
+			else
+				echo "FAIL: WDTT не раньше Clash — кто победит, зависит от порядка загрузки"
+				echo "  FIX: обновите routing до v3.19.0+ и /usr/libexec/wdtt/routing reload $IFACE"
+				ok=0
+			fi
+		fi
+		# Clash пропускает уже помеченные пакеты — на этом держится selective.
+		if [ "$flavor" = "ssclash" ]; then
+			if nft list chain inet clash CLASH_MARK 2>/dev/null | grep -q '0xff00'; then
+				echo "OK: Clash пропускает трафик, помеченный WDTT (mark and 0xff00)"
+			else
+				echo "WARN: у Clash нет правила 'mark and 0xff00 != 0 return'"
+				echo "  Обновите ssclash либо переключите WDTT в external"
+			fi
+		fi
+	elif is_external_mode || [ "$MODE" = "full" ]; then
+		echo "SKIP: nft-таблица WDTT не нужна (режим ${MODE:-?})"
+	else
+		echo "WARN: выборочный режим, но nft-таблицы WDTT нет"
+		echo "  FIX: /usr/libexec/wdtt/routing reload $IFACE"
+	fi
+
+	# 4. DNS: fake-ip отдаёт 198.18.x.x вместо реальных адресов,
+	#    и выборочные правила WDTT (nftset) начинают собирать мусор.
+	if [ -f "$CLASH_CONF" ] && grep -qE '^[[:space:]]*enhanced-mode:[[:space:]]*fake-ip' "$CLASH_CONF" 2>/dev/null; then
+		echo "clash_dns=fake-ip"
+		if ! is_external_mode && [ "$MODE" != "full" ]; then
+			echo "FAIL: fake-ip + выборочный режим WDTT несовместимы — в nftset попадут фейковые IP"
+			echo "  FIX: домены WDTT в fake-ip-filter у Clash, либо enhanced-mode: redir-host,"
+			echo "       либо WDTT → external и списки целиком в Clash"
+			ok=0
+		fi
+	else
+		echo "clash_dns=redir-host (реальные IP — выборочный режим WDTT работает)"
+	fi
+
+	# 5. Контрольный канал WDTT (VK TURN / peer) не должен уходить в прокси.
+	if [ -f "$CLASH_SETTINGS" ]; then
+		echo "clash_proxy_mode=$(sed -n 's/^PROXY_MODE=//p' "$CLASH_SETTINGS" 2>/dev/null | head -1)"
+		echo "clash_mode=$(sed -n 's/^MODE=//p' "$CLASH_SETTINGS" 2>/dev/null | head -1)"
+	fi
+	if [ -x /usr/libexec/wdtt/uplink ]; then
+		echo "wdtt_uplink=$(/usr/libexec/wdtt/uplink status 2>/dev/null | sed -n 's/^uplink_dev=//p' | head -1)"
+	fi
+	echo "note: трафик wdttd к VK TURN идёт через uplink в обход туннеля;"
+	echo "      если Clash проксирует и WAN — исключите uplink в его настройках"
+
+	[ "$ok" -eq 1 ]
+}
+
+do_fix() {
+	local changed=0
+
+	if [ "$TABLE" != "$DEFAULT_TABLE" ]; then
+		case " $CLASH_TABLES " in
+		*" $TABLE "*)
+			uci set wdtt.globals.route_table="$DEFAULT_TABLE" 2>/dev/null
+			uci commit wdtt 2>/dev/null
+			echo "route_table: $TABLE → $DEFAULT_TABLE"
+			TABLE="$DEFAULT_TABLE"
+			changed=1
+			;;
+		esac
+	fi
+
+	# Убрать своё из таблицы Clash, ничего чужого не трогая.
+	while ip rule del fwmark "$MARK" table 100 2>/dev/null; do :; done
+	ip route del default dev "$IFACE" table 100 2>/dev/null && {
+		echo "убран маршрут WDTT из таблицы 100"
+		changed=1
+	}
+
+	if [ -x /usr/libexec/wdtt/datapath ]; then
+		/usr/libexec/wdtt/datapath ensure "$IFACE" >/dev/null 2>&1 || true
+		echo "datapath перезапущен"
+	fi
+
+	[ "$changed" -eq 1 ] || echo "нечего чинить"
+	do_status
+}
+
+do_hint() {
+	cat <<EOF
+WDTT + Clash (ssclash / OpenClash), v3.19.0
+
+Две рабочие схемы:
+
+1. Разделение трафика (обычный случай)
+   WDTT и Clash живут параллельно и тянут каждый свой трафик.
+   WDTT: режим «Выборочный», домены в LuCI WDTT.
+   Clash: свои правила; пакеты с меткой WDTT он пропускает сам.
+   Требуется: разные таблицы (WDTT $TABLE, Clash 100/101) и DNS без fake-ip.
+
+2. Clash выбирает, WDTT возит (как с Podkop)
+   uci set wdtt.globals.routing_mode=external
+   В Clash указать выход через интерфейс $IFACE (interface-name: $IFACE).
+   Списки доменов — только в Clash, правила WDTT не читаются.
+
+Чего делать нельзя:
+   - полный туннель WDTT вместе с Clash: WDTT заберёт весь трафик;
+   - общая таблица маршрутизации: Clash потеряет "local default dev lo";
+   - fake-ip у Clash вместе с выборочным режимом WDTT.
+
+Проверка: /usr/libexec/wdtt/clash status
+Починка:  /usr/libexec/wdtt/clash fix
+EOF
+}
+
+case "${1:-status}" in
+	status) do_status ;;
+	fix) do_fix ;;
+	hint|help) do_hint ;;
+	*) echo "Usage: $0 {status|fix|hint}" >&2; exit 1 ;;
+esac

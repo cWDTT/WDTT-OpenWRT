@@ -5,6 +5,11 @@ IFACE="$(uci -q get wdtt.globals.iface 2>/dev/null)"
 IFACE="${IFACE:-wg-wdtt}"
 ROUTING_MODE="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
 ROUTING_MODE="${ROUTING_MODE:-external}"
+# Таблица 100 принадлежит ssclash/Clash — своя по умолчанию.
+ROUTE_TABLE="$(uci -q get wdtt.globals.route_table 2>/dev/null)"
+case "$ROUTE_TABLE" in
+''|*[!0-9]*) ROUTE_TABLE=7477 ;;
+esac
 
 is_external_mode() {
 	case "$ROUTING_MODE" in
@@ -125,13 +130,13 @@ elif [ "$ROUTING_MODE" != "full" ]; then
 		echo "FAIL: нет table inet wdtt — fw4 reload снёс selective; /usr/libexec/wdtt/routing restore $IFACE"
 	fi
 	ip rule show | grep -q 0x777474 && echo "OK: ip rule fwmark" || echo "FAIL: нет ip rule fwmark"
-	if ip route show table 100 2>/dev/null | grep -q .; then
-		echo "OK: table 100:"
-		ip route show table 100
+	if ip route show table "$ROUTE_TABLE" 2>/dev/null | grep -q .; then
+		echo "OK: table $ROUTE_TABLE:"
+		ip route show table "$ROUTE_TABLE"
 	else
-		echo "FAIL: table 100 ПУСТА — пакеты с mark некуда слать (типичный 0 трафика)"
-		echo "  FIX: ip route replace default dev $IFACE table 100"
-		ip route replace default dev "$IFACE" table 100 2>/dev/null \
+		echo "FAIL: table $ROUTE_TABLE ПУСТА — пакеты с mark некуда слать (типичный 0 трафика)"
+		echo "  FIX: ip route replace default dev $IFACE table $ROUTE_TABLE"
+		ip route replace default dev "$IFACE" table "$ROUTE_TABLE" 2>/dev/null \
 			&& echo "  → route добавлен" || echo "  → не удалось (wg-wdtt up?)"
 	fi
 	echo "wdtt.conf:"
@@ -288,6 +293,16 @@ else
 		echo "OK: routing active (state_file=selective)"
 	else
 		echo "FAIL: state_file=${state} (policy routing не применился)"
+	fi
+fi
+
+if [ -f /opt/clash/config.yaml ] || [ -f /etc/config/openclash ]; then
+	echo ""
+	echo "=== Clash (ssclash/OpenClash) рядом с WDTT ==="
+	if [ -x /usr/libexec/wdtt/clash ]; then
+		/usr/libexec/wdtt/clash status 2>/dev/null || true
+	else
+		echo "WARN: /usr/libexec/wdtt/clash отсутствует — sh /tmp/wdtt-install.sh"
 	fi
 fi
 

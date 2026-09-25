@@ -808,8 +808,8 @@ return view.extend({
 		o.default = 'wg';
 
 		o = s.option(form.ListValue, 'routing_mode', _('Режим туннеля'),
-			_('Podkop — WDTT только поднимает интерфейс туннеля, маршруты задаёт Podkop (sing-box). Выборочный — правила WDTT. Полный — весь трафик через WDTT.'));
-		o.value('external', _('Podkop (sing-box) — рекомендуется'));
+			_('Podkop / Clash — WDTT только поднимает интерфейс туннеля, маршруты задаёт Podkop (sing-box) или Clash. Выборочный — правила WDTT, работает и рядом с ssclash. Полный — весь трафик через WDTT, с Clash несовместим.'));
+		o.value('external', _('Podkop / Clash (внешние маршруты) — рекомендуется'));
 		o.value('selective', _('Выборочный (правила WDTT)'));
 		o.value('full', _('Полный туннель'));
 		o.default = 'external';
@@ -1093,10 +1093,11 @@ return view.extend({
 					? E('tr', {}, [E('td', {}, _('Datapath')), E('td', {}, _('OK') + (st.routing_mode ? ' (' + st.routing_mode + ')' : ''))])
 					: '',
 			(st.table100_ok === false || st.table100_ok === 0 || st.table100_ok === '0')
-				? E('tr', {}, [E('td', {}, _('Table 100')), E('td', { 'style': 'color:#c00' },
-					_('пусто — трафик не в туннель'))])
+				? E('tr', {}, [E('td', {}, _('Таблица') + ' ' + (st.route_table || 7477)),
+					E('td', { 'style': 'color:#c00' }, _('пусто — трафик не в туннель'))])
 				: (st.table100_ok === true || st.table100_ok === 1 || st.table100_ok === '1')
-					? E('tr', {}, [E('td', {}, _('Table 100')), E('td', {}, _('OK'))])
+					? E('tr', {}, [E('td', {}, _('Таблица') + ' ' + (st.route_table || 7477)),
+						E('td', {}, _('OK'))])
 					: '',
 			(st.nft_ok === false || st.nft_ok === 0 || st.nft_ok === '0')
 				? E('tr', {}, [E('td', {}, _('nft wdtt')), E('td', { 'style': 'color:#c00' }, _('нет таблицы'))])
@@ -1114,7 +1115,7 @@ return view.extend({
 		var mode = info.routing_mode || 'selective';
 		var modeLabel = mode === 'full'
 			? _('Полный')
-			: (mode === 'external' ? _('Podkop') : _('Выборочная'));
+			: (mode === 'external' ? _('Podkop / Clash') : _('Выборочная'));
 		var rules = normalizeRulesArray(info.rules);
 		var hasEnabledRoute = false;
 		var hasDisabledRoute = false;
@@ -1136,10 +1137,12 @@ return view.extend({
 			return lines.join('\n');
 		}
 		if (mode === 'external') {
-			lines.push(_('WDTT: туннель wg-wdtt (маршруты — Podkop/sing-box).'));
+			lines.push(_('WDTT: туннель wg-wdtt (маршруты — Podkop/sing-box или Clash).'));
 			lines.push(_('Podkop → section → VPN → interface: wg-wdtt'));
-			lines.push(_('Списки доменов — только в Podkop, не в WDTT.'));
+			lines.push(_('Clash (ssclash/OpenClash) → выход через interface-name: wg-wdtt'));
+			lines.push(_('Списки доменов — только там, не в WDTT.'));
 			lines.push(_('Проверка: ssh → /usr/libexec/wdtt/podkop status'));
+			lines.push(_('           ssh → /usr/libexec/wdtt/clash status'));
 			if (info.state_file && info.state_file !== 'external' && info.state_file !== 'missing')
 				lines.push(_('(!) Старый datapath: Save & Apply → «Переподключить».'));
 			return lines.join('\n');
