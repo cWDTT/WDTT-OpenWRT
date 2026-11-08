@@ -16,7 +16,7 @@ type RoutingMode string
 const (
 	RoutingFull      RoutingMode = "full"
 	RoutingSelective RoutingMode = "selective"
-	// RoutingExternal — только туннель wg-wdtt + firewall; маршруты — Podkop/PBR.
+	// RoutingExternal — только туннель wg-wdtt + firewall; маршруты — Podkop/Forkozz/Clash.
 	RoutingExternal RoutingMode = "external"
 )
 
@@ -126,7 +126,7 @@ func Load(path string) (*Settings, error) {
 		}
 	}
 
-	// routing_mode: selective | full | external (Podkop/PBR)
+	// routing_mode: selective | full | external (Podkop/Forkozz/Clash)
 	switch strings.ToLower(strings.TrimSpace(g["routing_mode"])) {
 	case "full":
 		s.RoutingMode = RoutingFull

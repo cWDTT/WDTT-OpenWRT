@@ -358,7 +358,7 @@ nft list set inet wdtt wdtt_route
 | `wdtt-client` | Go-демон `wdttd` + selective routing |
 | `luci-app-wdtt` | LuCI: туннель, правила, статус, логи |
 
-Вспомогательные скрипты живут в `/usr/libexec/wdtt/`: `datapath`, `routing`, `firewall-refresh`, `doctor`, `podkop` и `clash` (совместная работа с ssclash/OpenClash).
+Вспомогательные скрипты живут в `/usr/libexec/wdtt/`: `datapath`, `routing`, `firewall-refresh`, `doctor`, `podkop`, `forkozz` и `clash` (совместная работа с ssclash/OpenClash).
 
 ## Режимы работы
 
@@ -377,7 +377,7 @@ RAW быстрее за счёт отсутствия двойного шифр�
 
 | `routing_mode` | Кто решает, что в туннель | Правила WDTT | Когда выбирать |
 |----------------|---------------------------|--------------|----------------|
-| **`external`** (по умолчанию после установки, он же «Podkop») | **Podkop** / sing-box, Clash | не используются | Уже стоит Podkop или Clash и списки настроены там |
+| **`external`** (по умолчанию после установки, он же «Podkop») | **Podkop**, **Forkozz** или Clash | не используются | Уже стоит Podkop, Forkozz (Zapret Manager) или Clash и списки настроены там |
 | **`selective`** | WDTT: домены, подсети, URL-списки | используются | Нужен обход без Podkop, своими списками; работает и рядом с ssclash |
 | **`full`** | весь трафик роутера | не используются | Нужно завернуть в туннель абсолютно всё; с Clash несовместим |
 
@@ -428,7 +428,7 @@ uci commit wdtt
 
 Режим **full** — весь трафик роутера через WDTT, секции `rule` не читаются.
 
-Режим **external** — туннель без маршрутов WDTT, выбор трафика отдаётся Podkop или Clash, см. следующие разделы.
+Режим **external** — туннель без маршрутов WDTT, выбор трафика отдаётся Podkop, Forkozz или Clash, см. следующие разделы.
 
 ## Режим Podkop — кто выбирает трафик
 
@@ -481,6 +481,19 @@ uci commit wdtt
 Когда handshake есть, а сайты из списков Podkop не открываются, типичных причин три: в Podkop указан не тот интерфейс (проверяется `podkop status`), включён `Route Allowed IPs`, или `routing_mode` остался `selective` и правила WDTT конфликтуют с sing-box.
 
 Заворачивать один и тот же трафик обоими механизмами не нужно. Если хочется управлять списками из LuCI WDTT — переключайтесь на `selective` и выключайте WDTT-интерфейс в Podkop; держать оба режима одновременно смысла нет.
+
+## Режим Forkozz — те же правила, другой движок
+
+Forkozz из [Zapret Manager](https://github.com/StressOzz/Zapret-Manager) устроен так же, как Podkop: это NetShift, конфиг `/etc/config/forkozz` или `/etc/config/netshift`. WDTT в режиме `external` только поднимает `wg-wdtt`. Какой сайт идёт в туннель, по-прежнему решают секции Forkozz.
+
+В секции Forkozz: **Подключение → Туннель** → `wg-wdtt` (в RAW — `tun-wdtt`). Списки сервисов остаются в Forkozz. `Route Allowed IPs` у этого интерфейса выключен.
+
+```bash
+/usr/libexec/wdtt/forkozz status
+/usr/libexec/wdtt/forkozz hint
+```
+
+Если Forkozz не установлен, `status` пишет `SKIP` и не считает это ошибкой. `FAIL: секция Forkozz не указывает на wg-wdtt` значит туннель в секции ещё не выбран. Один и тот же трафик не нужно одновременно отдавать Podkop и Forkozz.
 
 ## WDTT рядом с ssclash / SSClash-Go / OpenClash (v3.19.0)
 

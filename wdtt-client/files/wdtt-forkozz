@@ -1,0 +1,127 @@
+#!/bin/sh
+# Проверка связки WDTT (external) + Forkozz (NetShift в Zapret Manager).
+# WDTT_FORKOZZ_VERSION=3.19.1
+
+IFACE="$(uci -q get wdtt.globals.iface 2>/dev/null)"
+IFACE="${IFACE:-wg-wdtt}"
+if [ "$(uci -q get wdtt.globals.tunnel_mode 2>/dev/null)" = "raw" ] && [ "$IFACE" = "wg-wdtt" ]; then
+	IFACE="tun-wdtt"
+fi
+NET_IF="$(uci -q get network.wdtt.device 2>/dev/null)"
+NET_IF="${NET_IF:-$IFACE}"
+MODE="$(uci -q get wdtt.globals.routing_mode 2>/dev/null)"
+
+is_external_mode() {
+	case "$MODE" in
+	external|podkop|tunnel|tunnel_only) return 0 ;;
+	esac
+	return 1
+}
+
+forkozz_pkgs() {
+	local pkg
+	for pkg in forkozz netshift; do
+		if [ -f "/etc/config/$pkg" ]; then
+			echo "$pkg"
+		fi
+	done
+}
+
+forkozz_installed() {
+	[ -n "$(forkozz_pkgs)" ] && return 0
+	command -v netshift >/dev/null 2>&1
+}
+
+iface_is_wdtt() {
+	case "$1" in
+	"$IFACE"|"$NET_IF"|wdtt|wg-wdtt|tun-wdtt) return 0 ;;
+	esac
+	return 1
+}
+
+forkozz_matches_wdtt() {
+	local pkg sec ct action iface found=""
+	for pkg in $(forkozz_pkgs); do
+		for sec in $(uci -q show "$pkg" 2>/dev/null | sed -n "s/^${pkg}\\.\\([^=]*\\)=section\$/\\1/p"); do
+			[ -n "$sec" ] || continue
+			iface="$(uci -q get "${pkg}.${sec}.interface" 2>/dev/null)"
+			[ -n "$iface" ] || iface="$(uci -q get "${pkg}.${sec}.vpn_interface" 2>/dev/null)"
+			[ -n "$iface" ] || iface="$(uci -q get "${pkg}.${sec}.tunnel" 2>/dev/null)"
+			iface_is_wdtt "$iface" || continue
+			ct="$(uci -q get "${pkg}.${sec}.connection_type" 2>/dev/null)"
+			action="$(uci -q get "${pkg}.${sec}.action" 2>/dev/null)"
+			echo "pkg=${pkg} section=${sec} interface=${iface} type=${ct:-${action:-tunnel}}"
+			found=1
+		done
+	done
+	[ -n "$found" ]
+}
+
+do_status() {
+	local ok=1 pkgs match
+
+	echo "wdtt_routing_mode=${MODE:-?}"
+	echo "wdtt_iface=$IFACE"
+	echo "network_wdtt_device=$NET_IF"
+
+	if ! is_external_mode; then
+		echo "WARN: routing_mode не external — для Forkozz: uci set wdtt.globals.routing_mode=external"
+		ok=0
+	fi
+
+	if ip link show "$IFACE" >/dev/null 2>&1; then
+		echo "OK: $IFACE up"
+	else
+		echo "FAIL: $IFACE down — LuCI WDTT → Подключить"
+		ok=0
+	fi
+
+	if ! forkozz_installed; then
+		echo "SKIP: Forkozz/NetShift не установлен"
+		[ "$ok" -eq 1 ]
+		return
+	fi
+
+	pkgs="$(forkozz_pkgs)"
+	if [ -n "$pkgs" ]; then
+		echo "OK: config $(echo "$pkgs" | tr '\n' ' ')"
+	else
+		echo "WARN: бинарник netshift есть, /etc/config/netshift нет"
+		ok=0
+	fi
+
+	match="$(forkozz_matches_wdtt)" || match=""
+	if [ -n "$match" ]; then
+		echo "$match" | while read -r line; do
+			echo "OK: Forkozz VPN → WDTT ($line)"
+		done
+	else
+		echo "FAIL: секция Forkozz не указывает на $IFACE — Подключение → Туннель: $IFACE"
+		ok=0
+	fi
+
+	if pgrep -f '[s]ing-box' >/dev/null 2>&1 || pgrep -f '[n]etshift' >/dev/null 2>&1; then
+		echo "OK: sing-box/netshift running"
+	else
+		echo "WARN: sing-box не запущен — /etc/init.d/netshift restart"
+	fi
+
+	[ "$ok" -eq 1 ]
+}
+
+do_hint() {
+	cat <<EOF
+WDTT + Forkozz (Zapret Manager / NetShift, v3.19.1):
+  LuCI WDTT → Режим «Podkop / Forkozz / Clash» → Подключить
+  Zapret Manager → Forkozz → секция → Подключение → Туннель: $IFACE
+  Списки сервисов остаются в Forkozz, правила WDTT в этом режиме не читаются
+  Route Allowed IPs у туннеля — выключено
+Проверка: /usr/libexec/wdtt/forkozz status
+EOF
+}
+
+case "${1:-status}" in
+	status) do_status ;;
+	hint|help) do_hint ;;
+	*) echo "Usage: $0 {status|hint}" >&2; exit 1 ;;
+esac

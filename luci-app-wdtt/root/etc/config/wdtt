@@ -24,7 +24,7 @@ config globals 'globals'
 	option device_id ''
 	option iface 'wg-wdtt'
 	option tunnel_mode 'wg'
-	# selective = правила WDTT; full = весь трафик; external = только туннель (Podkop/Clash/PBR)
+	# selective = правила WDTT; full = весь трафик; external = только туннель (Podkop/Forkozz/Clash)
 	option routing_mode 'external'
 	# Таблица policy routing. 100 занята ssclash/Clash (TPROXY) — не ставьте её.
 	option route_table '7477'

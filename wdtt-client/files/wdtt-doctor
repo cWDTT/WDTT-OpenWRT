@@ -212,7 +212,7 @@ if [ "$ROUTING_MODE" = "full" ]; then
 		echo "WARN: ip_forward=0 — sysctl -w net.ipv4.ip_forward=1"
 	fi
 elif is_external_mode; then
-	echo "--- external (Podkop) ---"
+	echo "--- external (Podkop / Forkozz / Clash) ---"
 	[ -x /usr/libexec/wdtt/datapath ] && /usr/libexec/wdtt/datapath ensure "$IFACE" 2>/dev/null || true
 else
 	echo "--- reload routing (selective) ---"
@@ -221,7 +221,16 @@ fi
 
 echo ""
 if is_external_mode; then
-	[ -x /usr/libexec/wdtt/podkop ] && /usr/libexec/wdtt/podkop status 2>/dev/null || echo "podkop status: script missing"
+	if [ -x /usr/libexec/wdtt/podkop ]; then
+		/usr/libexec/wdtt/podkop status 2>/dev/null || true
+	else
+		echo "podkop status: script missing"
+	fi
+	if [ -x /usr/libexec/wdtt/forkozz ]; then
+		/usr/libexec/wdtt/forkozz status 2>/dev/null || true
+	else
+		echo "forkozz status: script missing"
+	fi
 elif ! [ "$ROUTING_MODE" = "full" ]; then
 	/usr/libexec/wdtt/routing status 2>/dev/null || echo "routing status failed"
 fi
@@ -252,7 +261,7 @@ elif is_external_mode; then
 	else
 		echo "WARN: state_file=${state} — LuCI Save & Apply → Переподключить"
 	fi
-	echo "Правила WDTT не используются — списки доменов настраивайте в Podkop"
+	echo "Правила WDTT не используются — списки доменов настраивайте в Podkop, Forkozz или Clash"
 else
 	echo "=== rule type check ==="
 	rules_ok=0
@@ -314,9 +323,9 @@ if [ "$ROUTING_MODE" = "full" ]; then
 	echo "3) doctor: state_file=full, default route через wg-wdtt"
 	echo "4) curl -4 https://2ip.io с LAN-клиента"
 elif is_external_mode; then
-	echo "1) LuCI WDTT: Режим «Podkop» → Подключить"
-	echo "2) LuCI Podkop: section VPN → interface=$IFACE"
-	echo "3) /usr/libexec/wdtt/podkop status — OK"
+	echo "1) LuCI WDTT: Режим «Podkop / Forkozz / Clash» → Подключить"
+	echo "2) Podkop или Forkozz: секция VPN/Туннель → interface=$IFACE"
+	echo "3) /usr/libexec/wdtt/podkop status или /usr/libexec/wdtt/forkozz status — OK"
 	echo "4) curl -4 https://2ip.io с LAN-клиента (DNS=роутер)"
 else
 	echo "1) LuCI: Правила → Домены, Включено → «Принять изменения»"

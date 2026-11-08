@@ -488,6 +488,7 @@ install_wdtt_helpers() {
 		"keepalive:wdtt-client/files/wdtt-keepalive" \
 		"datapath:wdtt-client/files/wdtt-datapath" \
 		"podkop:wdtt-client/files/wdtt-podkop" \
+		"forkozz:wdtt-client/files/wdtt-forkozz" \
 		"clash:wdtt-client/files/wdtt-clash"
 	do
 		dest="/usr/libexec/wdtt/${f%%:*}"

@@ -808,8 +808,8 @@ return view.extend({
 		o.default = 'wg';
 
 		o = s.option(form.ListValue, 'routing_mode', _('Режим туннеля'),
-			_('Podkop / Clash — WDTT только поднимает интерфейс туннеля, маршруты задаёт Podkop (sing-box) или Clash. Выборочный — правила WDTT, работает и рядом с ssclash. Полный — весь трафик через WDTT, с Clash несовместим.'));
-		o.value('external', _('Podkop / Clash (внешние маршруты) — рекомендуется'));
+			_('Podkop / Forkozz / Clash — WDTT только поднимает интерфейс туннеля, маршруты задаёт Podkop, Forkozz (Zapret Manager) или Clash. Выборочный — правила WDTT, работает и рядом с ssclash. Полный — весь трафик через WDTT, с Clash несовместим.'));
+		o.value('external', _('Podkop / Forkozz / Clash (внешние маршруты) — рекомендуется'));
 		o.value('selective', _('Выборочный (правила WDTT)'));
 		o.value('full', _('Полный туннель'));
 		o.default = 'external';
@@ -844,7 +844,7 @@ return view.extend({
 		var routingMode = uci.get('wdtt', 'globals', 'routing_mode') || 'external';
 		if (routingMode === 'selective') {
 			s = m.section(form.TypedSection, 'rule', _('Правила маршрутизации'),
-				_('Только режим «Выборочный». С Podkop — домены в LuCI Podkop, не здесь.'));
+				_('Только режим «Выборочный». С Podkop или Forkozz списки задаются там, не здесь.'));
 			s.anonymous = false;
 			s.addremove = true;
 
@@ -1115,7 +1115,7 @@ return view.extend({
 		var mode = info.routing_mode || 'selective';
 		var modeLabel = mode === 'full'
 			? _('Полный')
-			: (mode === 'external' ? _('Podkop / Clash') : _('Выборочная'));
+			: (mode === 'external' ? _('Podkop / Forkozz / Clash') : _('Выборочная'));
 		var rules = normalizeRulesArray(info.rules);
 		var hasEnabledRoute = false;
 		var hasDisabledRoute = false;
@@ -1137,11 +1137,13 @@ return view.extend({
 			return lines.join('\n');
 		}
 		if (mode === 'external') {
-			lines.push(_('WDTT: туннель wg-wdtt (маршруты — Podkop/sing-box или Clash).'));
+			lines.push(_('WDTT: туннель wg-wdtt (маршруты — Podkop, Forkozz или Clash).'));
 			lines.push(_('Podkop → section → VPN → interface: wg-wdtt'));
+			lines.push(_('Forkozz (Zapret Manager) → секция → Туннель: wg-wdtt'));
 			lines.push(_('Clash (ssclash/OpenClash) → выход через interface-name: wg-wdtt'));
 			lines.push(_('Списки доменов — только там, не в WDTT.'));
 			lines.push(_('Проверка: ssh → /usr/libexec/wdtt/podkop status'));
+			lines.push(_('           ssh → /usr/libexec/wdtt/forkozz status'));
 			lines.push(_('           ssh → /usr/libexec/wdtt/clash status'));
 			if (info.state_file && info.state_file !== 'external' && info.state_file !== 'missing')
 				lines.push(_('(!) Старый datapath: Save & Apply → «Переподключить».'));
