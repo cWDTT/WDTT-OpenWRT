@@ -102,6 +102,19 @@ http_get() {
 	return 1
 }
 
+# GitHub первым, дальше CDN и прокси. Один запрос на адрес, без трёх повторов.
+repo_mirror_bases() {
+	printf '%s\n' \
+		"$RAW_PIN" \
+		"$JSDELIVR_PIN" \
+		"https://ghfast.top/${RAW_PIN}" \
+		"https://ghproxy.net/${RAW_PIN}" \
+		"$RAW_URL" \
+		"$JSDELIVR_URL" \
+		"https://ghfast.top/${RAW_URL}" \
+		"https://ghproxy.net/${RAW_URL}"
+}
+
 # Скачать файл из репозитория через зеркала (если raw.githubusercontent.com недоступен)
 download_repo_file() {
 	local relpath="$1" dest="$2" label="$3"
@@ -113,15 +126,17 @@ download_repo_file() {
 		[ -s "$dest" ] && return 0
 	fi
 
-	for base in "$JSDELIVR_PIN" "$RAW_URL" "$JSDELIVR_URL"; do
+	for base in $(repo_mirror_bases); do
 		url="${base}/${relpath}"
-		msg "  try: $url"
-		if download_file "$url" "$dest"; then
+		msg "  --> $url"
+		rm -f "$dest"
+		if http_get "$url" "$dest" ""; then
 			return 0
 		fi
+		warn "     нет ответа, следующее зеркало"
 	done
 
-	err "FAILED: $label (все зеркала недоступны)"
+	err "FAILED: $label (GitHub и зеркала недоступны)"
 	return 1
 }
 
@@ -165,29 +180,25 @@ github_api_get() {
 }
 
 check_github_access() {
+	local base url
+
 	if [ "$WDTT_SKIP_PROBE" = "1" ]; then
 		warn "Пропуск проверки CDN (WDTT_SKIP_PROBE=1)"
 		return 0
 	fi
 
-	# Проверяем доступ (jsDelivr pin → raw → jsDelivr @main)
-	if download_file "$JSDELIVR_PIN/install.sh" "$DOWNLOAD_DIR/probe.sh"; then
+	msg "Проверка источника файлов (GitHub, затем зеркала)..."
+	for base in $(repo_mirror_bases); do
+		url="${base}/install.sh"
+		msg "  --> $url"
 		rm -f "$DOWNLOAD_DIR/probe.sh"
-		msg "CDN: jsDelivr (pin ${REPO_REF}) OK"
-		return 0
-	fi
-
-	if download_file "$RAW_URL/install.sh" "$DOWNLOAD_DIR/probe.sh"; then
-		rm -f "$DOWNLOAD_DIR/probe.sh"
-		msg "GitHub: публичный доступ OK"
-		return 0
-	fi
-
-	if download_file "$JSDELIVR_URL/install.sh" "$DOWNLOAD_DIR/probe.sh"; then
-		rm -f "$DOWNLOAD_DIR/probe.sh"
-		msg "CDN: jsDelivr @main OK"
-		return 0
-	fi
+		if http_get "$url" "$DOWNLOAD_DIR/probe.sh" ""; then
+			rm -f "$DOWNLOAD_DIR/probe.sh"
+			msg "Источник доступен"
+			return 0
+		fi
+		warn "     нет ответа, следующее зеркало"
+	done
 
 	# install.sh уже на роутере (raw GitHub сработал) — продолжаем
 	if [ -s /tmp/wdtt-install.sh ] && grep -q WDTT_INSTALL_VERSION /tmp/wdtt-install.sh 2>/dev/null; then
@@ -357,13 +368,15 @@ install_bin() {
 		rm -f "$dest"
 	done
 
-	# jsDelivr (файл в репо bin/) — работает когда github.com/releases заблокирован
+	# GitHub, затем jsDelivr и прокси — когда github.com/releases недоступен
 	for url in \
-		"${JSDELIVR_PIN}/${relpath}" \
-		"${JSDELIVR_URL}/${relpath}" \
-		"https://cdn.jsdelivr.net/gh/${GITHUB_REPO}@${WDTT_BIN_TAG}/${relpath}" \
 		"${RAW_PIN}/${relpath}" \
-		"${RAW_URL}/${relpath}"
+		"${JSDELIVR_PIN}/${relpath}" \
+		"https://ghfast.top/${RAW_PIN}/${relpath}" \
+		"https://ghproxy.net/${RAW_PIN}/${relpath}" \
+		"${RAW_URL}/${relpath}" \
+		"${JSDELIVR_URL}/${relpath}" \
+		"https://cdn.jsdelivr.net/gh/${GITHUB_REPO}@${WDTT_BIN_TAG}/${relpath}"
 	do
 		try_download_bin "$url" "$dest" && return 0
 	done
@@ -493,9 +506,7 @@ install_wdtt_helpers() {
 	do
 		dest="/usr/libexec/wdtt/${f%%:*}"
 		src="${f#*:}"
-		if download_file "$RAW_URL/$src" "$dest" 2>/dev/null \
-			|| download_file "${JSDELIVR_PIN}/$src" "$dest" 2>/dev/null \
-			|| install_repo_file "$src" "$dest" "${f%%:*}" 2>/dev/null; then
+		if install_repo_file "$src" "$dest" "${f%%:*}"; then
 			chmod 0755 "$dest"
 			msg "  OK: ${f%%:*}"
 			ok=1
