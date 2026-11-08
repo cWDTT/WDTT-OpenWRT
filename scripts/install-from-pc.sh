@@ -87,6 +87,10 @@ tar czf "$TMP/wdtt-repo.tar.gz" -C "$DIR" \
 	wdtt-client/files/wdtt-full-tunnel \
 	wdtt-client/files/wdtt-firewall-refresh \
 	wdtt-client/files/wdtt-keepalive \
+	wdtt-client/files/wdtt-datapath \
+	wdtt-client/files/wdtt-podkop \
+	wdtt-client/files/wdtt-forkozz \
+	wdtt-client/files/wdtt-clash \
 	wdtt-client/files/wdtt-uplink \
 	wdtt-client/files/wdtt-domain-lib.sh \
 	wdtt-client/files/wdtt-set-domains \
