@@ -4,30 +4,42 @@ OpenWRT-клиент WDTT (WireGuard over VK TURN) с полным или выб
 
 ## Быстрая установка на роутер
 
-### Рабочие ссылки v3.19.1 (совместная работа с ssclash / SSClash-Go)
+Одна команда. Сначала GitHub, если он не отвечает — jsDelivr, ghfast и ghproxy. На экране видно, какой адрес пробуется, затем шаги самого установщика. Оболочка роутера — ash, поэтому без `<(...)`.
+
+```sh
+OUT=/tmp/wdtt-bootstrap.sh
+echo "WDTT: качаем загрузчик"
+ok=0
+for url in \
+  https://raw.githubusercontent.com/cWDTT/WDTT-OpenWRT/main/bootstrap.sh \
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@main/bootstrap.sh \
+  https://ghfast.top/https://raw.githubusercontent.com/cWDTT/WDTT-OpenWRT/main/bootstrap.sh \
+  https://ghproxy.net/https://raw.githubusercontent.com/cWDTT/WDTT-OpenWRT/main/bootstrap.sh
+do
+  echo "--> $url"
+  rm -f "$OUT"
+  if wget -T 20 -O "$OUT" "$url" 2>/dev/null || uclient-fetch -T 20 -O "$OUT" "$url"; then
+    grep -q 'WDTT bootstrap' "$OUT" && ok=1 && break
+  fi
+  echo "    нет ответа, следующее зеркало"
+done
+if [ "$ok" = 1 ]; then
+  sh "$OUT"
+else
+  echo "Загрузчик не скачался"
+fi
+```
+
+Загрузчик берёт `install.sh` с коммита `0dec5dd` тем же порядком зеркал. `install.sh` качает остальные файлы с `ffcd337` и тоже переключается, печатая каждый адрес.
+
+### Прямые ссылки v3.19.1
 
 | Назначение | URL |
 |------------|-----|
-| **Установщик** | `https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1b6e392/install.sh` |
+| **Установщик** | `https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@0dec5dd/install.sh` |
 | routing (selective) | `https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@ffcd337/wdtt-client/files/wdtt-routing` |
 | firewall-refresh | `https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@ffcd337/wdtt-client/files/wdtt-firewall-refresh` |
 | push-domain-fix (с ПК) | `sh scripts/push-domain-fix.sh root@IP` |
-
-Установка одной командой (pin):
-
-```bash
-wget -O /tmp/wdtt-install.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1b6e392/install.sh
-sh /tmp/wdtt-install.sh
-```
-
-Альтернатива через `@main` (внутри pin на коммит для остальных файлов; jsDelivr может кэшировать 5–15 мин):
-
-```bash
-wget -O /tmp/wdtt-install.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@main/install.sh
-sh /tmp/wdtt-install.sh
-```
 
 ## Установка на роутер — по шагам
 
@@ -49,13 +61,13 @@ sh /tmp/wdtt-install.sh
 
 ```bash
 wget -O /tmp/wdtt-install.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1b6e392/install.sh
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@0dec5dd/install.sh
 sh /tmp/wdtt-install.sh
 ```
 
 Пакеты установщик доставит сам: `wireguard-tools`, `kmod-wireguard`, `nftables`, `kmod-nft-core`, `kmod-nft-nat`, `ca-bundle`, а также `kmod-tun` (нужен только для RAW-режима). Отдельно он заменяет `dnsmasq` на **`dnsmasq-full`** — без него не работает выборочный режим, потому что домены раскладываются через `nftset`. Эти два пакета взаимоисключающие, поэтому замена штатная.
 
-Демон `wdttd` тянется с jsDelivr, так что доступ к GitHub Releases с роутера не обязателен.
+Демон `wdttd` качается с GitHub, а если он не отвечает — с jsDelivr и прокси. Доступ к GitHub Releases не обязателен.
 
 В конце должно быть `WDTT installer v3.19.1+` и проверки `[OK] routing (nft+nftset)`, `dnsmasq nftset`, `firewall lan→wdtt`.
 
@@ -128,7 +140,7 @@ apk del wget-nossl
 
 ```bash
 wget -O /tmp/wdtt-install.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1b6e392/install.sh
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@0dec5dd/install.sh
 sh /tmp/wdtt-install.sh
 ```
 
@@ -144,7 +156,7 @@ sh /tmp/wdtt-install.sh
 
 ```bash
 wget -O /tmp/wdtt-install.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1b6e392/install.sh
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@0dec5dd/install.sh
 sh /tmp/wdtt-install.sh --clean
 ```
 
@@ -152,7 +164,7 @@ sh /tmp/wdtt-install.sh --clean
 
 ```bash
 wget -O /tmp/wdtt-install.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1b6e392/install.sh
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@0dec5dd/install.sh
 sh /tmp/wdtt-install.sh --uninstall
 ```
 
@@ -213,17 +225,19 @@ ssh root@192.168.1.1 'WDTT_LOCAL_BIN=/tmp/wdttd sh /tmp/wdtt-install.sh'
 
 ```bash
 uclient-fetch -q -O /tmp/wdtt-install.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@1b6e392/install.sh
+  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@0dec5dd/install.sh
 sh /tmp/wdtt-install.sh
 ```
 
-### Вариант C — bootstrap (зеркала + fallback)
+### Вариант C — тот же загрузчик одним файлом
 
-```bash
-uclient-fetch -q -O /tmp/wdtt-bootstrap.sh \
-  https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@main/bootstrap.sh
+Если команда из начала уже сохранила `/tmp/wdtt-bootstrap.sh`:
+
+```sh
 sh /tmp/wdtt-bootstrap.sh
 ```
+
+Повтор с чистым конфигом: `sh /tmp/wdtt-bootstrap.sh --clean`
 
 Должно появиться `WDTT installer v3.2` и шаги `Step 1/3`, `Step 2/3`, `Step 3/3`.
 

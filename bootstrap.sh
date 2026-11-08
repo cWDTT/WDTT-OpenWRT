@@ -1,35 +1,53 @@
 #!/bin/sh
-# Bootstrap с зеркалами (если raw.githubusercontent.com недоступен)
+# WDTT bootstrap
+# Качает install.sh: сначала GitHub, затем зеркала. Дальше установщик сам печатает шаги.
+# Запуск на роутере (ash, без bash):
+#   wget -O /tmp/wdtt-bootstrap.sh URL && sh /tmp/wdtt-bootstrap.sh
 OUT="/tmp/wdtt-install.sh"
+REPO_REF="0dec5dd"
 
-try_download() {
+fetch_to() {
 	url="$1"
-	echo "Try: $url"
+	dest="$2"
+	rm -f "$dest"
 	if [ -x /bin/uclient-fetch ]; then
-		uclient-fetch -t 30 -q -O "$OUT" "$url" && [ -s "$OUT" ] && return 0
+		uclient-fetch -T 25 -O "$dest" "$url" && [ -s "$dest" ] && return 0
 	fi
-	wget -T 30 -q -O "$OUT" "$url" 2>/dev/null && [ -s "$OUT" ] && return 0
-	curl -fsSL --connect-timeout 30 -o "$OUT" "$url" 2>/dev/null && [ -s "$OUT" ] && return 0
+	if command -v wget >/dev/null 2>&1; then
+		wget -T 25 -O "$dest" "$url" && [ -s "$dest" ] && return 0
+	fi
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL --connect-timeout 25 -m 60 -o "$dest" "$url" && [ -s "$dest" ] && return 0
+	fi
 	return 1
 }
 
-REPO_REF="1b6e392"
-
+echo "WDTT: загрузка установщика"
+ok=0
 for url in \
+	"https://raw.githubusercontent.com/cWDTT/WDTT-OpenWRT/${REPO_REF}/install.sh" \
 	"https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@${REPO_REF}/install.sh" \
-	"https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@main/install.sh" \
-	"https://raw.githubusercontent.com/cWDTT/WDTT-OpenWRT/main/install.sh"
+	"https://ghfast.top/https://raw.githubusercontent.com/cWDTT/WDTT-OpenWRT/${REPO_REF}/install.sh" \
+	"https://ghproxy.net/https://raw.githubusercontent.com/cWDTT/WDTT-OpenWRT/${REPO_REF}/install.sh"
 do
-	try_download "$url" && sh "$OUT" && exit 0
+	echo "--> $url"
+	if fetch_to "$url" "$OUT" && grep -q WDTT_INSTALL_VERSION "$OUT"; then
+		echo "    получен"
+		ok=1
+		break
+	fi
+	echo "    нет ответа, следующее зеркало"
 done
 
-echo "ERROR: GitHub CDN недоступен с роутера."
-echo ""
-echo "Установите с компьютера:"
-echo "  git clone https://github.com/cWDTT/WDTT-OpenWRT.git"
-echo "  cd WDTT-OpenWRT"
-echo "  scp install.sh root@192.168.1.1:/tmp/"
-echo "  # скачайте wdttd-linux-arm64 с Releases на ПК"
-echo "  scp wdttd-linux-arm64 root@192.168.1.1:/tmp/wdttd"
-echo "  ssh root@192.168.1.1 'WDTT_LOCAL_BIN=/tmp/wdttd sh /tmp/install.sh'"
-exit 1
+if [ "$ok" != 1 ]; then
+	echo "ERROR: GitHub и зеркала недоступны."
+	echo "С компьютера в одной сети с роутером:"
+	echo "  git clone https://github.com/cWDTT/WDTT-OpenWRT.git"
+	echo "  cd WDTT-OpenWRT"
+	echo "  sh scripts/install-from-pc.sh root@192.168.1.1"
+	exit 1
+fi
+
+echo "WDTT: запуск установки"
+sh "$OUT" "$@"
+exit $?
