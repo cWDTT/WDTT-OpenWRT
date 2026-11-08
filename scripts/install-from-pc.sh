@@ -13,7 +13,7 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="/tmp/wdtt-pc-install"
 VERSION="3.19.1"
 REPO="https://github.com/cWDTT/WDTT-OpenWRT"
-PIN="91aec64"
+PIN="1b6e392"
 MIN_BIN_SIZE=1048576
 
 wdtt_local_bin_ok() {

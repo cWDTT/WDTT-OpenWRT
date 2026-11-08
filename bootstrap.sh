@@ -13,7 +13,7 @@ try_download() {
 	return 1
 }
 
-REPO_REF="91aec64"
+REPO_REF="1b6e392"
 
 for url in \
 	"https://cdn.jsdelivr.net/gh/cWDTT/WDTT-OpenWRT@${REPO_REF}/install.sh" \
